@@ -34,22 +34,30 @@ async fn main() {
 
     tracing::info!("Initializing Antigravity API Gateway (100% Rust Native)");
 
-    // Load accounts from parent directory or data/
-    let accounts_path = if std::path::Path::new("data/accounts.json").exists() {
-        "data/accounts.json"
-    } else if std::path::Path::new("../data/accounts.json").exists() {
-        "../data/accounts.json"
-    } else {
-        "accounts.json"
-    };
-
-    let pool = storage::AccountPool::load_from_file(accounts_path, 8, 48)
-        .unwrap_or_else(|e| {
-            tracing::warn!("Could not load accounts file ({}). Starting in fallback mode.", e);
-            storage::AccountPool::load_from_file("/dev/null", 8, 48).unwrap_or_else(|_| {
-                panic!("Failed to initialize account pool");
+    // 1. Try loading accounts from environment variable ACCOUNTS_JSON
+    // 2. Otherwise load from disk
+    let pool = if let Ok(json_env) = std::env::var("ACCOUNTS_JSON") {
+        tracing::info!("Loading accounts from ACCOUNTS_JSON environment variable");
+        storage::AccountPool::load_from_json_str(&json_env, 8, 48)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed parsing ACCOUNTS_JSON ({}). Starting in empty mode.", e);
+                storage::AccountPool::empty(8, 48)
             })
-        });
+    } else {
+        let accounts_path = if std::path::Path::new("data/accounts.json").exists() {
+            "data/accounts.json"
+        } else if std::path::Path::new("../data/accounts.json").exists() {
+            "../data/accounts.json"
+        } else {
+            "accounts.json"
+        };
+
+        storage::AccountPool::load_from_file(accounts_path, 8, 48)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Could not load accounts file ({}). Starting in safe standby mode.", e);
+                storage::AccountPool::empty(8, 48)
+            })
+    };
 
     tracing::info!("Loaded {} active Google accounts into Rust Lease Engine", pool.get_account_count());
 

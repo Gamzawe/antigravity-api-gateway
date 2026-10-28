@@ -50,9 +50,18 @@ pub struct AccountPool {
 }
 
 impl AccountPool {
-    pub fn load_from_file(path: &str, max_per_account: usize, max_total: usize) -> Result<Self, String> {
-        let content = std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path, e))?;
-        let config: AccountsConfig = serde_json::from_str(&content).map_err(|e| format!("Failed to parse {}: {}", path, e))?;
+    pub fn empty(max_per_account: usize, max_total: usize) -> Self {
+        Self {
+            accounts: Vec::new(),
+            client: reqwest::Client::builder().pool_max_idle_per_host(20).build().unwrap(),
+            total_in_flight: Arc::new(AtomicUsize::new(0)),
+            max_per_account,
+            max_total,
+        }
+    }
+
+    pub fn load_from_json_str(content: &str, max_per_account: usize, max_total: usize) -> Result<Self, String> {
+        let config: AccountsConfig = serde_json::from_str(content).map_err(|e| format!("Failed to parse accounts JSON: {}", e))?;
 
         let mut accounts = Vec::new();
         for entry in config.accounts {
@@ -82,6 +91,11 @@ impl AccountPool {
             max_per_account,
             max_total,
         })
+    }
+
+    pub fn load_from_file(path: &str, max_per_account: usize, max_total: usize) -> Result<Self, String> {
+        let content = std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path, e))?;
+        Self::load_from_json_str(&content, max_per_account, max_total)
     }
 
     /// Single-flight OAuth refresh to avoid thundering herd on token expiration
