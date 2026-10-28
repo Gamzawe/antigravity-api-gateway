@@ -1,16 +1,14 @@
 services:
   - type: web
     name: antigravity-api-gateway
-    runtime: node
+    runtime: rust
     plan: free
     region: oregon
-    buildCommand: npm ci --omit=dev --omit=optional --ignore-scripts
-    startCommand: node src/index.js
+    buildCommand: cargo build --release
+    startCommand: ./target/release/rust-gateway
     healthCheckPath: /health
     autoDeploy: true
     envVars:
-      - key: NODE_ENV
-        value: production
       - key: PORT
         value: 10000
       - key: HOST
