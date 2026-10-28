@@ -1,0 +1,13 @@
+.git
+.unlazy
+.env
+.env.*
+data
+node_modules
+coverage
+test-results
+tests
+docs
+images
+openspec
+*.log

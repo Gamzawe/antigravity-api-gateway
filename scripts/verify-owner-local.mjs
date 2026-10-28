@@ -1,0 +1,47 @@
+import assert from 'node:assert/strict';
+import { readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = fileURLToPath(new URL('../', import.meta.url));
+const directory = resolve(root, '.unlazy/token-free-owner');
+const sha = path => createHash('sha256').update(readFileSync(path)).digest('hex');
+const baseline = JSON.parse(readFileSync(resolve(directory, 'runtime-baseline.json'), 'utf8'));
+for (const [name, hash] of Object.entries(baseline)) {
+  const file = resolve(root, name);
+  assert.equal(existsSync(file) ? sha(file) : null, hash, `${name} must not be created, reset or altered by this change`);
+}
+const base = 'http://localhost:8089';
+const request = path => fetch(base + path, { signal: AbortSignal.timeout(10000) });
+const health = await request('/health');
+assert.equal(health.status, 200);
+assert.deepEqual(await health.json(), { status: 'ok' });
+const response = await request('/console/api/session');
+assert.equal(response.status, 200);
+const state = await response.json();
+const expectedConfigured = baseline['data/console/access.json'] === null ? false : Boolean(JSON.parse(readFileSync(resolve(root, 'data/console/access.json'), 'utf8')).owner);
+assert.equal(state.configured, expectedConfigured);
+assert.equal(state.authenticated, false);
+const page = await request('/console/');
+assert.equal(page.status, 200);
+const html = await page.text();
+assert.match(html, /id="username"/);
+assert.match(html, /id="password"/);
+assert.doesNotMatch(html, /setup-token|Private setup token/i);
+const app = await request('/console/app.js');
+assert.equal(app.status, 200);
+const source = await app.text();
+assert.match(source, /Create your owner account/);
+assert.doesNotMatch(source, /setup-token/);
+assert.equal((await request('/v1/key-check')).status, 401);
+assert.equal((await request('/console/api/keys')).status, 401);
+const review = JSON.parse(readFileSync(resolve(directory, 'independent-review.json'), 'utf8'));
+assert.equal(review.verdict.passed, true);
+assert.deepEqual(review.verdict.security_concerns, []);
+assert.deepEqual(review.verdict.logic_errors, []);
+assert.ok(Object.keys(review.reviewedFiles).length >= 3);
+for (const name of ['src/console/access.mjs', 'public/app.js', 'public/index.html']) assert.ok(review.reviewedFiles[name], `review must cover ${name}`);
+for (const [name, hash] of Object.entries(review.reviewedFiles)) assert.equal(sha(resolve(root, name)), hash, `reviewed bytes changed: ${name}`);
+writeFileSync(resolve(directory, 'local-verification.json'), JSON.stringify({ verifiedAt: new Date().toISOString(), base, configured: state.configured, checks: ['health', 'token-free-served-html', 'token-free-served-app', 'owner-state-preserved', 'source-accounts-unchanged', 'unauthenticated-denied', 'reviewed-source-hashes-match'], reviewFiles: Object.keys(review.reviewedFiles).length }, null, 2));
+console.log('TOKEN_FREE_LOCAL_AND_REVIEW_OK');

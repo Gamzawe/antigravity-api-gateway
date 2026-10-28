@@ -1,0 +1,424 @@
+{
+  "kind": "proposed-implementation-backlog",
+  "executionStatus": "not-started",
+  "version": "1.0.0",
+  "createdAt": "2026-10-28T07:10:00.000Z",
+  "targetSystem": "D:/Side-Projects/antigravity-api-gateway",
+  "summary": "Implementation-ready backlog for Antigravity API Gateway concurrency, correctness, and deployment hardening. Implementation is not started; this document establishes requirements, packages, tests, and boundaries.",
+  "authorizationBoundaries": [
+    "No application runtime code, config, or tests are modified during the planning phase.",
+    "Local implementation of packages WP-01 through WP-12 proceeds under standard local test development without live API calls.",
+    "Live provider qualification and load benchmarking (WP-13) strictly require explicit user authorization, specified cost/request ceilings, and monitored account error thresholds.",
+    "Client configuration adjustments in OpenCode or Hermes (WP-14) require explicit user consent and backup confirmation prior to editing.",
+    "Remote VPS deployment, DNS configuration, and account secret transfer (WP-15, WP-16) strictly require explicit user consent and private pre-provisioning."
+  ],
+  "definitionOfDone": [
+    "Every work package must have automated deterministic unit/integration tests running under node --test.",
+    "No test may bypass authentication or mock away the core bug without testing the real code path.",
+    "Zero regressions across the existing 14 console security and authentication test suites.",
+    "Source files must maintain clean linting and strict non-root Linux container compatibility.",
+    "All private credentials (tokens, secrets, sessions) must remain strictly redacted and excluded from git and docker layers."
+  ],
+  "milestones": [
+    {
+      "id": "M1",
+      "title": "Protocol & Stream Reliability Core",
+      "packages": ["WP-01", "WP-02", "WP-03", "WP-04", "WP-05"],
+      "exitCriteria": [
+        "Stream replay bug eliminated with automated proof of single downstream generation.",
+        "Tool call streaming emits finish_reason 'tool_calls' consistently.",
+        "Framing-aware SSE parser correctly handles EOF and chunk boundaries.",
+        "Canonical model resolution unified across admission, routes, and rate-limits.",
+        "Disabled accounts and unexpired cooldowns strictly honored."
+      ]
+    },
+    {
+      "id": "M2",
+      "title": "Auth Concurrency & Storage Integrity",
+      "packages": ["WP-06", "WP-07", "WP-08"],
+      "exitCriteria": [
+        "OAuth refresh is single-flight per account under concurrent requests.",
+        "Rate limit parser reliably handles Google ms, s, and header timestamps.",
+        "Serialized atomic state saves prevent race conditions and reload accurately reflects disk."
+      ]
+    },
+    {
+      "id": "M3",
+      "title": "High-Concurrency Scheduler & Admission Queue",
+      "packages": ["WP-09", "WP-10", "WP-11", "WP-12"],
+      "exitCriteria": [
+        "Atomic attempt leases reserve accounts before async work with 100% cleanup.",
+        "Bounded admission queue enforces byte/request limits and cancellation pruning.",
+        "Accurate usage metrics and structured telemetry exposed without sensitive leaks.",
+        "Model fallback remains strictly opt-in with explicit capability compatibility checks."
+      ]
+    },
+    {
+      "id": "M4",
+      "title": "Empirical Qualification & Production Deployment",
+      "packages": ["WP-13", "WP-14", "WP-15", "WP-16"],
+      "exitCriteria": [
+        "Controlled live benchmark measures true throughput and latency percentiles.",
+        "OpenCode and Hermes clients verified against actual gateway reasoning payloads.",
+        "Pre-provisioned single-owner bootstrap enforced before public container startup.",
+        "Remote Caddy HTTPS proxy verified with end-to-end streaming flush."
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-STRM-REPLAY",
+      "title": "Eliminate Stream Replay and Double Generation",
+      "description": "Ensure that once downstream streaming has commenced, an upstream error terminates the stream with an error event rather than retrying and interleaving a second generation.",
+      "acceptance": ["No stream may yield more than one message_start event under upstream retry scenarios.", "Downstream commitment flag prevents failover loops once content has flushed."]
+    },
+    {
+      "id": "REQ-STRM-TOOLS",
+      "title": "Preserve Tool Call Finish Reason in SSE",
+      "description": "Fix OpenAI streaming conversion so that tool calls result in finish_reason 'tool_calls' instead of 'stop' when upstream Google CloudCode returns STOP.",
+      "acceptance": ["When parts contain functionCall, finish_reason must be 'tool_calls' across all stream chunks.", "Tool call parameters and IDs must match non-streaming behavior."]
+    },
+    {
+      "id": "REQ-STRM-FRAMING",
+      "title": "Framing-Aware SSE Parsing and Truncation Detection",
+      "description": "Replace simple newline splitting with framing-aware parsing, handling buffer flushes, UTF-8 boundaries, and treating truncated responses as explicit errors rather than empty success.",
+      "acceptance": ["Incomplete SSE buffers at EOF fail closed with stream truncation error.", "Empty streams do not emit placeholder success text."]
+    },
+    {
+      "id": "REQ-MODEL-CANONICAL",
+      "title": "Unified Model Resolution and Cooldown Scoping",
+      "description": "Resolve model aliases to canonical IDs at entry point, ensuring rate limit lookups, admission checks, and request conversion use identical identifiers.",
+      "acceptance": ["Model aliases like gemini-3.8-flash map to gemini-3.8-flash-tiered before rate-limit checks.", "Rate limits recorded under canonical IDs are recognized on alias requests."]
+    },
+    {
+      "id": "REQ-ACCT-ELIGIBILITY",
+      "title": "Strict Account Eligibility and Cooldown Preservation",
+      "description": "Ensure accounts marked enabled: false are excluded from selection, and remove route-level blanket resets that wipe unexpired cooldowns.",
+      "acceptance": ["Disabled accounts (enabled: false) are never selected by pickStickyAccount or pickNext.", "Inference requests never call resetAllRateLimits on unexpired cooldowns."]
+    },
+    {
+      "id": "REQ-AUTH-SINGLEFLIGHT",
+      "title": "Single-Flight Token Refresh and 401 Re-acquisition",
+      "description": "Deduplicate concurrent token refresh calls per account, and ensure post-401 retries re-acquire fresh credentials before attempting subsequent endpoints.",
+      "acceptance": ["Concurrent credential calls for the same account trigger exactly one OAuth refresh request.", "401 retry loop fetches a fresh token before attempting the fallback endpoint."]
+    },
+    {
+      "id": "REQ-PARSER-COOLDOWN",
+      "title": "Robust Quota Reset Delay and Timestamp Parsing",
+      "description": "Fix regex patterns for quotaResetDelay (seconds and milliseconds) and headers to compute accurate backoff durations.",
+      "acceptance": ["Decimal seconds ('1.5s') parse accurately to 1500ms without fallback truncation.", "Millisecond durations ('754.43ms') parse correctly to integer milliseconds."]
+    },
+    {
+      "id": "REQ-STATE-CONCURRENCY",
+      "title": "Serialized Account State Persistence and Dynamic Reload",
+      "description": "Serialize and debounce account updates to disk, prevent concurrent file corruption, and ensure the reload endpoint properly refreshes in-memory state.",
+      "acceptance": ["Overlapping save operations queue sequentially using atomic temp files.", "POST /v1/accounts/reload completely refreshes accounts from disk."]
+    },
+    {
+      "id": "REQ-SCHED-LEASE",
+      "title": "Atomic Account Lease with Bounded Concurrency",
+      "description": "Implement an atomic select-and-reserve attempt lease mechanism tracking active in-flight requests per account and releasing reliably in finally blocks.",
+      "acceptance": ["Accounts are reserved synchronously before async work, preventing overbooking.", "Leases are idempotently released on success, error, cancellation, and disconnect."]
+    },
+    {
+      "id": "REQ-SCHED-QUEUE",
+      "title": "Bounded Fair Admission Queue with Cancellation Pruning",
+      "description": "Implement an in-memory queue with max request count and byte limits, fair scheduling across API keys, and immediate removal on client disconnect.",
+      "acceptance": ["Excess requests beyond queue capacity receive HTTP 429 with explicit Retry-After.", "Client abort signals immediately dequeue waiting requests without orphan processing."]
+    },
+    {
+      "id": "REQ-OBSERVABILITY",
+      "title": "Structured Request Telemetry and Token Usage Accounting",
+      "description": "Provide detailed logging of queue delays, lease durations, TTFT, model IDs, and correct streamed token usage (prompt + candidate tokens).",
+      "acceptance": ["Streamed OpenAI usage includes accurate prompt_tokens and completion_tokens.", "Logs record request performance metrics without leaking keys, tokens, or prompt bodies."]
+    },
+    {
+      "id": "REQ-MODEL-CAPABILITY",
+      "title": "Opt-In Fallback and Capability-Aware Request Translation",
+      "description": "Keep model fallback strictly opt-in, validate model transitions against supported capabilities, and accurately translate thinking parameters and output token caps.",
+      "acceptance": ["Model fallback is disabled by default; when enabled, only pre-approved compatible models are used.", "Gemini output token limits and reasoning budgets match validated upstream specifications."]
+    },
+    {
+      "id": "REQ-BENCHMARK-LOAD",
+      "title": "Empirical Concurrency Benchmarking under Real Quotas",
+      "description": "Design an authorized, controlled benchmark protocol measuring p50/p95 latency and sustainable RPM under varying concurrent agent counts.",
+      "acceptance": ["Benchmark measures actual task completion and tool turns, not just raw ping latency.", "Explicit stopping criteria prevent quota burn or account suspensions."]
+    },
+    {
+      "id": "REQ-CLIENT-INTEG",
+      "title": "Client Compatibility Verification (OpenCode and Hermes)",
+      "description": "Verify that OpenCode and Hermes properly serialize reasoning parameters and display streamed thinking without truncation or tool errors.",
+      "acceptance": ["OpenCode private-gateway provider successfully executes multi-turn tool sessions.", "Hermes custom provider correctly captures and formats reasoning_content."]
+    },
+    {
+      "id": "REQ-DEPLOY-BOOTSTRAP",
+      "title": "Enforced Pre-Provisioned Single-Owner Bootstrap",
+      "description": "Require owner credentials to be pre-created in private storage before allowing public internet exposure, preventing first-visitor takeover.",
+      "acceptance": ["Container startup fails closed if exposed to public origin without configured owner.", "start-vps.sh removes obsolete setup-token references and enforces private data init."]
+    },
+    {
+      "id": "REQ-DEPLOY-VPS",
+      "title": "Production Caddy Reverse Proxy and Network Topology",
+      "description": "Deploy Docker Compose stack with non-root gateway container and Caddy reverse proxy using internal service networking and unbuffered SSE flush.",
+      "acceptance": ["Caddyfile proxies directly to antigravity-gateway:8080 with flush_interval -1.", "Gateway loopback port binding prevents direct internet exposure of unproxied ports."]
+    }
+  ],
+  "workPackages": [
+    {
+      "id": "WP-01",
+      "title": "Stream Replay Elimination & Downstream Commitment Guard",
+      "goal": "Prevent stream handlers from restarting or switching endpoints once partial output has been yielded to the client.",
+      "requirements": ["REQ-STRM-REPLAY"],
+      "dependsOn": [],
+      "status": "planned",
+      "authorization": "local-implementation",
+      "fileOwnership": ["src/cloudcode/streaming-handler.js", "tests/unit/streaming-handler.test.mjs"],
+      "acceptance": [
+        "Streaming handler tracks downstream commitment and raises terminal error on failure after first yield.",
+        "Unit tests prove that upstream error after partial yield produces error event, never second message_start."
+      ],
+      "tests": ["node --test tests/unit/streaming-handler.test.mjs"],
+      "evidence": "tests/unit/streaming-handler.test.mjs passing with simulated interrupted stream"
+    },
+    {
+      "id": "WP-02",
+      "title": "Streamed Tool Calls Finish Reason Alignment",
+      "goal": "Ensure functionCall blocks in streaming responses result in finish_reason 'tool_calls' rather than 'stop'.",
+      "requirements": ["REQ-STRM-TOOLS"],
+      "dependsOn": [],
+      "status": "planned",
+      "authorization": "local-implementation",
+      "fileOwnership": ["src/cloudcode/sse-streamer.js", "src/format/openai-compat.js", "tests/unit/sse-tool-finish.test.mjs"],
+      "acceptance": [
+        "When candidate contains functionCall, stopReason in sse-streamer remains 'tool_use' even if finishReason is STOP.",
+        "convertAnthropicEventToOpenAI translates tool_use stop_reason to finish_reason: 'tool_calls'."
+      ],
+      "tests": ["node --test tests/unit/sse-tool-finish.test.mjs"],
+      "evidence": "tests/unit/sse-tool-finish.test.mjs verifying finish_reason: 'tool_calls'"
+    },
+    {
+      "id": "WP-03",
+      "title": "Framing-Aware SSE Parser & Truncation Guard",
+      "goal": "Implement robust SSE framing parser that handles chunk boundaries, UTF-8 splits, and rejects truncated EOFs.",
+      "requirements": ["REQ-STRM-FRAMING"],
+      "dependsOn": [],
+      "status": "planned",
+      "authorization": "local-implementation",
+      "fileOwnership": ["src/cloudcode/sse-streamer.js", "src/cloudcode/sse-parser.js", "tests/unit/sse-framing.test.mjs"],
+      "acceptance": [
+        "Unterminated SSE frames at EOF trigger explicit StreamTruncatedError instead of synthetic empty message.",
+        "Decoder correctly buffers multi-byte UTF-8 sequences split across raw stream chunks."
+      ],
+      "tests": ["node --test tests/unit/sse-framing.test.mjs"],
+      "evidence": "tests/unit/sse-framing.test.mjs passing all edge cases including split chunks and abrupt EOF"
+    },
+    {
+      "id": "WP-04",
+      "title": "Canonical Model Identity & Cooldown Scoping",
+      "goal": "Ensure all routes, rate-limit checkers, and request converters use canonical model IDs consistently.",
+      "requirements": ["REQ-MODEL-CANONICAL"],
+      "dependsOn": [],
+      "status": "planned",
+      "authorization": "local-implementation",
+      "fileOwnership": ["src/server.js", "src/constants.js", "src/account-manager/rate-limits.js", "tests/unit/model-canonical.test.mjs"],
+      "acceptance": [
+        "resolveModel is applied at the entry point of /v1/chat/completions, /v1/responses, and /v1/messages.",
+        "Rate limits recorded against canonical models are properly checked when requests use aliases."
+      ],
+      "tests": ["node --test tests/unit/model-canonical.test.mjs"],
+      "evidence": "tests/unit/model-canonical.test.mjs proving alias requests observe canonical rate limits"
+    },
+    {
+      "id": "WP-05",
+      "title": "Strict Account Eligibility & Route Cooldown Preservation",
+      "goal": "Prevent selection of disabled accounts and remove reckless blanket rate-limit resets in route handlers.",
+      "requirements": ["REQ-ACCT-ELIGIBILITY"],
+      "dependsOn": ["WP-04"],
+      "status": "planned",
+      "authorization": "local-implementation",
+      "fileOwnership": ["src/account-manager/selection.js", "src/account-manager/rate-limits.js", "src/server.js", "tests/unit/eligibility.test.mjs"],
+      "acceptance": [
+        "isAccountUsable and getAvailableAccounts explicitly filter out accounts where enabled === false.",
+        "Removed resetAllRateLimits calls on incoming requests in src/server.js lines 631, 776, 860."
+      ],
+      "tests": ["node --test tests/unit/eligibility.test.mjs"],
+      "evidence": "tests/unit/eligibility.test.mjs verifying disabled accounts are never routed and unexpired cooldowns survive"
+    },
+    {
+      "id": "WP-06",
+      "title": "Single-Flight Token Refresh & Post-401 Re-acquisition",
+      "goal": "Deduplicate concurrent refresh requests per account and refresh token prior to second-endpoint retry.",
+      "requirements": ["REQ-AUTH-SINGLEFLIGHT"],
+      "dependsOn": [],
+      "status": "planned",
+      "authorization": "local-implementation",
+      "fileOwnership": ["src/account-manager/credentials.js", "src/cloudcode/message-handler.js", "src/cloudcode/streaming-handler.js", "tests/unit/auth-singleflight.test.mjs"],
+      "acceptance": [
+        "Concurrent calls to getTokenForAccount share a single pending Promise, preventing token refresh storms.",
+        "Upon 401 response, cache is cleared and fresh token is fetched before trying the next fallback endpoint."
+      ],
+      "tests": ["node --test tests/unit/auth-singleflight.test.mjs"],
+      "evidence": "tests/unit/auth-singleflight.test.mjs confirming single refresh execution under concurrent load"
+    },
+    {
+      "id": "WP-07",
+      "title": "Quota Reset Delay & Error Duration Parser Hardening",
+      "goal": "Fix regexes and parsing logic for quotaResetDelay, Retry-After, and ISO timestamps.",
+      "requirements": ["REQ-PARSER-COOLDOWN"],
+      "dependsOn": [],
+      "status": "planned",
+      "authorization": "local-implementation",
+      "fileOwnership": ["src/cloudcode/rate-limit-parser.js", "tests/unit/rate-limit-parser.test.mjs"],
+      "acceptance": [
+        "quotaResetDelay regex properly extracts decimal seconds (1.5s -> 1500ms) and milliseconds (750ms -> 750ms).",
+        "Parser returns valid finite millisecond delay or null, logging anomalies clearly."
+      ],
+      "tests": ["node --test tests/unit/rate-limit-parser.test.mjs"],
+      "evidence": "tests/unit/rate-limit-parser.test.mjs validating diverse header and error string payloads"
+    },
+    {
+      "id": "WP-08",
+      "title": "Serialized Account State Persistence & Dynamic Reload",
+      "goal": "Serialize account writes using an in-memory queue and ensure reload endpoint completely refreshes state.",
+      "requirements": ["REQ-STATE-CONCURRENCY"],
+      "dependsOn": ["WP-05"],
+      "status": "planned",
+      "authorization": "local-implementation",
+      "fileOwnership": ["src/account-manager/storage.js", "src/account-manager/index.js", "src/server.js", "tests/unit/storage-concurrency.test.mjs"],
+      "acceptance": [
+        "Concurrent saveAccounts calls execute sequentially via Promise chain with atomic file replacement.",
+        "POST /v1/accounts/reload resets initialized flag and re-reads config from disk without server restart."
+      ],
+      "tests": ["node --test tests/unit/storage-concurrency.test.mjs"],
+      "evidence": "tests/unit/storage-concurrency.test.mjs proving zero corrupt writes under rapid save cycles"
+    },
+    {
+      "id": "WP-09",
+      "title": "Atomic Account Lease Engine (Select-and-Reserve)",
+      "goal": "Implement in-flight connection tracking with atomic reservation and guaranteed lease release.",
+      "requirements": ["REQ-SCHED-LEASE"],
+      "dependsOn": ["WP-01", "WP-02", "WP-03", "WP-04", "WP-05", "WP-06", "WP-07", "WP-08"],
+      "status": "planned",
+      "authorization": "local-implementation",
+      "fileOwnership": ["src/account-manager/lease-engine.js", "src/account-manager/selection.js", "src/account-manager/index.js", "tests/unit/lease-engine.test.mjs"],
+      "acceptance": [
+        "Acquires attempt lease synchronously during selection, incrementing account inFlightCount.",
+        "Lease object exposes release() method guaranteed to be idempotent and decrement count exactly once."
+      ],
+      "tests": ["node --test tests/unit/lease-engine.test.mjs"],
+      "evidence": "tests/unit/lease-engine.test.mjs verifying count never leaks or goes negative under simulated failure"
+    },
+    {
+      "id": "WP-10",
+      "title": "Bounded Fair Admission Queue & Cancellation Pruning",
+      "goal": "Implement an in-memory queue to absorb temporary traffic spikes with byte limits and client abort handling.",
+      "requirements": ["REQ-SCHED-QUEUE"],
+      "dependsOn": ["WP-09"],
+      "status": "planned",
+      "authorization": "local-implementation",
+      "fileOwnership": ["src/scheduler/admission-queue.js", "src/server.js", "tests/unit/admission-queue.test.mjs"],
+      "acceptance": [
+        "Queue rejects requests exceeding max_queue_depth or max_queue_bytes with HTTP 429 and Retry-After.",
+        "When client disconnects or AbortSignal triggers, pending queue entries are immediately pruned."
+      ],
+      "tests": ["node --test tests/unit/admission-queue.test.mjs"],
+      "evidence": "tests/unit/admission-queue.test.mjs testing overflow rejection and disconnect pruning"
+    },
+    {
+      "id": "WP-11",
+      "title": "Telemetry & Accurate Streamed Token Usage Accounting",
+      "goal": "Record per-request queue delays, lease durations, and repair prompt_tokens calculation in SSE events.",
+      "requirements": ["REQ-OBSERVABILITY"],
+      "dependsOn": ["WP-01", "WP-10"],
+      "status": "planned",
+      "authorization": "local-implementation",
+      "fileOwnership": ["src/format/openai-compat.js", "src/utils/telemetry.js", "src/server.js", "tests/unit/telemetry.test.mjs"],
+      "acceptance": [
+        "Streamed usage block reflects promptTokenCount and candidatesTokenCount accurately from Google metadata.",
+        "Structured log events record queue time, execution duration, and account index without leaking prompts or keys."
+      ],
+      "tests": ["node --test tests/unit/telemetry.test.mjs"],
+      "evidence": "tests/unit/telemetry.test.mjs verifying usage fields and safe logging format"
+    },
+    {
+      "id": "WP-12",
+      "title": "Capability-Aware Request Mapping & Opt-In Fallback",
+      "goal": "Enforce strict opt-in model fallback, validate model capabilities, and fix thinking/output parameter mapping.",
+      "requirements": ["REQ-MODEL-CAPABILITY"],
+      "dependsOn": ["WP-04"],
+      "status": "planned",
+      "authorization": "local-implementation",
+      "fileOwnership": ["src/fallback-config.js", "src/format/request-converter.js", "src/format/openai-compat.js", "tests/unit/model-capability.test.mjs"],
+      "acceptance": [
+        "Model fallback remains disabled by default; only explicitly configured compatible chains are executed.",
+        "reasoning_effort and thinkingLevel serialize accurately to Google thinkingConfig with proper output token headroom."
+      ],
+      "tests": ["node --test tests/unit/model-capability.test.mjs"],
+      "evidence": "tests/unit/model-capability.test.mjs verifying output caps, thinking budgets, and strict opt-in fallback"
+    },
+    {
+      "id": "WP-13",
+      "title": "Controlled Canary Load Benchmark & Capacity Qualification",
+      "goal": "Conduct a separately authorized, small-scale live benchmark to measure actual RPM and latency under real quotas.",
+      "requirements": ["REQ-BENCHMARK-LOAD"],
+      "dependsOn": ["WP-09", "WP-10", "WP-11"],
+      "status": "planned",
+      "authorization": "live-approval",
+      "fileOwnership": ["scripts/benchmark-concurrency.mjs", "docs/BENCHMARK_RESULTS.md"],
+      "acceptance": [
+        "Runs only after user approves concurrency levels and cost/token ceilings.",
+        "Measures p50/p95 TTFT, queue duration, and error rates across 1 to 6 concurrent agents, stopping on consecutive 429s."
+      ],
+      "tests": ["node scripts/benchmark-concurrency.mjs --dry-run"],
+      "evidence": "docs/BENCHMARK_RESULTS.md containing measured data points, sample sizes, and error distributions"
+    },
+    {
+      "id": "WP-14",
+      "title": "Client Integration & Thinking Profile Validation",
+      "goal": "Validate end-to-end tool execution and reasoning stream rendering in OpenCode and Hermes.",
+      "requirements": ["REQ-CLIENT-INTEG"],
+      "dependsOn": ["WP-12"],
+      "status": "planned",
+      "authorization": "client-approval",
+      "fileOwnership": ["tests/integration/client-compatibility.test.mjs"],
+      "acceptance": [
+        "Hermes CLI executes multi-turn tool call session with reasoning rendered cleanly.",
+        "OpenCode private-gateway provider executes file edits and terminal tasks without thinking schema errors."
+      ],
+      "tests": ["node tests/integration/client-compatibility.test.mjs"],
+      "evidence": "Verified transcript of harmless tool execution turn with reasoning content captured"
+    },
+    {
+      "id": "WP-15",
+      "title": "Pre-Provisioned Owner Bootstrap & Packaging Hardening",
+      "goal": "Enforce private owner setup prior to public start and reconcile start-vps.sh instructions.",
+      "requirements": ["REQ-DEPLOY-BOOTSTRAP"],
+      "dependsOn": ["WP-08"],
+      "status": "planned",
+      "authorization": "local-validation",
+      "fileOwnership": ["deploy/start-vps.sh", "deploy/install.sh", "src/index.js", "tests/console/deployment.test.mjs"],
+      "acceptance": [
+        "start-vps.sh validates existing access.json owner before launching public Docker stack.",
+        "Removed stale data/console/setup-token references from deployment scripts."
+      ],
+      "tests": ["node --test tests/console/deployment.test.mjs"],
+      "evidence": "tests/console/deployment.test.mjs confirming startup fails closed if owner is unconfigured in production"
+    },
+    {
+      "id": "WP-16",
+      "title": "Production Caddy Reverse Proxy & Service Networking",
+      "goal": "Configure production Docker Compose stack with internal Caddy service networking and unbuffered SSE.",
+      "requirements": ["REQ-DEPLOY-VPS"],
+      "dependsOn": ["WP-13", "WP-14", "WP-15"],
+      "status": "planned",
+      "authorization": "remote-approval",
+      "fileOwnership": ["deploy/Caddyfile", "docker-compose.yml", "Dockerfile"],
+      "acceptance": [
+        "Caddy reverse proxies to antigravity-gateway:8080 with flush_interval -1.",
+        "Gateway container binds 0.0.0.0 internally and only loopback port on host, ensuring all external traffic passes through Caddy."
+      ],
+      "tests": ["docker compose config"],
+      "evidence": "Validated compose configuration and verified remote HTTPS header flush"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: antigravity-api-gateway
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm ci --omit=dev --omit=optional --ignore-scripts
+    startCommand: node src/index.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATA_DIR
+        value: ./data
+      - key: PUBLIC_URL
+        sync: false
