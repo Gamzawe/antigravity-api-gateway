@@ -15,5 +15,8 @@ services:
         value: 0.0.0.0
       - key: DATA_DIR
         value: ./data
+      - key: ACCOUNTS_JSON
+        sync: false
+
       - key: PUBLIC_URL
         sync: false
