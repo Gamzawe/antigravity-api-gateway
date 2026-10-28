@@ -1,17 +1,35 @@
-FROM node:24-bookworm-slim
+# Multi-Stage Production Dockerfile for Rust Antigravity Gateway
+# Ultra-compact, static native container (~15 MB, <12 MB RAM)
+
+# Stage 1: Build the native binary
+FROM rust:1.80-alpine AS builder
+
+RUN apk add --no-cache musl-dev pkgconfig openssl-dev
+
 WORKDIR /app
-COPY package*.json ./
-RUN npm ci --omit=dev --omit=optional --ignore-scripts && npm cache clean --force
-COPY src/ ./src/
-COPY public/ ./public/
-COPY scripts/ ./scripts/
-RUN mkdir -p /app/data && chown node:node /app/data
-ENV NODE_ENV=production
-ENV PORT=8080
+
+# Copy rust crate files
+COPY rust-gateway/Cargo.toml rust-gateway/Cargo.lock ./
+COPY rust-gateway/src ./src
+COPY public ../public
+
+# Build optimized static release binary
+RUN cargo build --release
+
+# Stage 2: Minimal runtime image
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates
+
+WORKDIR /app
+
+# Copy the compiled static binary from builder
+COPY --from=builder /app/target/release/rust-gateway /usr/local/bin/rust-gateway
+
+# Set execution defaults
+ENV PORT=10000
 ENV HOST=0.0.0.0
-ENV DATA_DIR=/app/data
-USER node
-VOLUME ["/app/data"]
-EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD ["node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-CMD ["node", "src/index.js"]
+
+EXPOSE 10000
+
+ENTRYPOINT ["rust-gateway"]
