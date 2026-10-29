@@ -236,7 +236,6 @@ async fn console_models() -> impl IntoResponse {
     Json(serde_json::json!({
         "data": [
             {"id": "gemini-3.8-flash", "name": "Gemini 3.8 Flash"},
-            {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro"},
             {"id": "claude-sonnet-4-6", "name": "Claude 3.7 Sonnet"},
             {"id": "claude-opus-4-6-thinking", "name": "Claude 3.7 Sonnet (Thinking)"}
         ]

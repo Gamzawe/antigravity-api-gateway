@@ -19,8 +19,6 @@ pub fn resolve_model(model: &str) -> &'static str {
         "claude-opus-4-6-thinking"
     } else if lower.contains("claude") || lower.contains("sonnet") {
         "claude-sonnet-4-6"
-    } else if lower.contains("gemini-2.5-pro") {
-        "gemini-2.5-pro"
     } else if lower.contains("gemini-2.5-flash-thinking") {
         "gemini-2.5-flash-thinking"
     } else if lower.contains("gemini-2.5-flash-lite") {
