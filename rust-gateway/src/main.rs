@@ -145,16 +145,26 @@ async fn chat_completions(
             } else {
                 Some(h)
             }
+        })
+        .or_else(|| {
+            headers.get("x-api-key")
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.trim())
         });
 
-    let env_key = std::env::var("API_KEY").ok();
+    let env_key = std::env::var("API_KEY")
+        .or_else(|_| std::env::var("API_KEYS"))
+        .ok();
     let has_env_key = env_key.is_some();
     let has_store_keys = !state.key_store.list_keys().is_empty();
 
     if has_env_key || has_store_keys {
         let is_valid = match auth_header {
             Some(key) => {
-                let matches_env = env_key.as_deref().map(|ek| auth::verify_api_key(key, &[ek.to_string()])).unwrap_or(false);
+                let matches_env = env_key.as_deref().map(|ek| {
+                    let keys: Vec<String> = ek.split(',').map(|s| s.trim().to_string()).collect();
+                    auth::verify_api_key(key, &keys)
+                }).unwrap_or(false);
                 let matches_store = state.key_store.verify_key(key);
                 matches_env || matches_store
             }
