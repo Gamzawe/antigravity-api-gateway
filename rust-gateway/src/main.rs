@@ -126,6 +126,10 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "status": "ok",
         "runtime": "rust",
         "accounts_configured": state.pool.get_account_count(),
+        "active_in_flight": state.pool.get_total_in_flight(),
+        "queue_waiting": state.pool.get_queue_waiting(),
+        "max_concurrency": state.pool.get_max_total(),
+        "max_queue_depth": state.pool.get_max_queue_depth(),
         "arch": "tokio-axum-native"
     }))
 }

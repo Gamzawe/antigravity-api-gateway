@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::{Instant, Duration};
-use tokio::sync::{RwLock, Mutex};
+use tokio::sync::{RwLock, Mutex, Semaphore};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -45,6 +45,10 @@ pub struct AccountPool {
     accounts: Vec<Arc<ManagedAccount>>,
     client: reqwest::Client,
     total_in_flight: Arc<AtomicUsize>,
+    queue_waiting: Arc<AtomicUsize>,
+    queue_semaphore: Arc<Semaphore>,
+    max_queue_depth: usize,
+    queue_timeout_secs: u64,
     max_per_account: usize,
     max_total: usize,
 }
@@ -61,7 +65,20 @@ impl AccountPool {
             .and_then(|v| v.parse().ok())
             .unwrap_or(300);
 
-        tracing::info!("Capacity limits: max_per_account={}, max_total={}", max_per_account, max_total);
+        let max_queue_depth: usize = std::env::var("MAX_QUEUE_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+
+        let queue_timeout_secs: u64 = std::env::var("QUEUE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+
+        tracing::info!(
+            "Capacity limits: max_per_account={}, max_total={}, max_queue_depth={}, queue_timeout={}s",
+            max_per_account, max_total, max_queue_depth, queue_timeout_secs
+        );
 
         Self {
             accounts: Vec::new(),
@@ -73,6 +90,10 @@ impl AccountPool {
                 .build()
                 .unwrap(),
             total_in_flight: Arc::new(AtomicUsize::new(0)),
+            queue_waiting: Arc::new(AtomicUsize::new(0)),
+            queue_semaphore: Arc::new(Semaphore::new(max_total)),
+            max_queue_depth,
+            queue_timeout_secs,
             max_per_account,
             max_total,
         }
@@ -112,7 +133,20 @@ impl AccountPool {
             .and_then(|v| v.parse().ok())
             .unwrap_or(max_total);
 
-        tracing::info!("AccountPool configured with limits: max_per_account={}, max_total={}", max_per_account, max_total);
+        let max_queue_depth: usize = std::env::var("MAX_QUEUE_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+
+        let queue_timeout_secs: u64 = std::env::var("QUEUE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+
+        tracing::info!(
+            "AccountPool configured: max_per_account={}, max_total={}, max_queue_depth={}, queue_timeout={}s",
+            max_per_account, max_total, max_queue_depth, queue_timeout_secs
+        );
 
         Ok(Self {
             accounts,
@@ -124,6 +158,10 @@ impl AccountPool {
                 .build()
                 .unwrap(),
             total_in_flight: Arc::new(AtomicUsize::new(0)),
+            queue_waiting: Arc::new(AtomicUsize::new(0)),
+            queue_semaphore: Arc::new(Semaphore::new(max_total)),
+            max_queue_depth,
+            queue_timeout_secs,
             max_per_account,
             max_total,
         })
@@ -212,13 +250,46 @@ impl AccountPool {
         tracing::info!("Refreshed OAuth token for: {}", acc.email);
         Ok(new_token)
     }
+}
 
-    /// Acquire attempt lease
+struct QueueWaitingGuard(Arc<AtomicUsize>);
+
+impl Drop for QueueWaitingGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl AccountPool {
+    /// Acquire attempt lease with Tokio FIFO fair queuing
     pub async fn acquire_lease(&self) -> Option<(Arc<ManagedAccount>, RustLeaseGuard)> {
-        if self.total_in_flight.load(Ordering::SeqCst) >= self.max_total {
+        // 1. Fast-path backpressure: if waiting queue buffer is full, shed load immediately
+        if self.queue_waiting.load(Ordering::Relaxed) >= self.max_queue_depth {
+            tracing::warn!("FIFO queue buffer full ({}/{}), rejecting burst", self.queue_waiting.load(Ordering::Relaxed), self.max_queue_depth);
             return None;
         }
 
+        // 2. Register in FIFO waiting line
+        self.queue_waiting.fetch_add(1, Ordering::SeqCst);
+        let _wait_guard = QueueWaitingGuard(self.queue_waiting.clone());
+
+        // 3. Wait in Tokio FIFO queue for a global execution slot (strictly arrival-ordered)
+        let permit = match tokio::time::timeout(
+            Duration::from_secs(self.queue_timeout_secs),
+            self.queue_semaphore.acquire(),
+        ).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                tracing::error!("Semaphore closed: {}", e);
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!("Request timed out waiting in FIFO queue after {}s", self.queue_timeout_secs);
+                return None;
+            }
+        };
+
+        // 4. Select least-loaded account (< max_per_account and not rate limited)
         let now = Instant::now();
         let mut candidates = Vec::new();
 
@@ -235,7 +306,10 @@ impl AccountPool {
             candidates.push((acc.clone(), inf, frac, last));
         }
 
-        if candidates.is_empty() { return None; }
+        if candidates.is_empty() {
+            // Permit is dropped here automatically if no account is ready
+            return None;
+        }
 
         candidates.sort_by(|a, b| {
             a.1.cmp(&b.1)
@@ -248,9 +322,13 @@ impl AccountPool {
         self.total_in_flight.fetch_add(1, Ordering::SeqCst);
         *chosen.last_used.write().await = Instant::now();
 
+        // 5. Transfer permit ownership to RustLeaseGuard
+        permit.forget();
+
         let guard = RustLeaseGuard {
             account_in_flight: chosen.in_flight.clone(),
             total_in_flight: self.total_in_flight.clone(),
+            queue_semaphore: self.queue_semaphore.clone(),
         };
 
         Some((chosen, guard))
@@ -265,16 +343,34 @@ impl AccountPool {
     pub fn get_account_count(&self) -> usize {
         self.accounts.len()
     }
+
+    pub fn get_total_in_flight(&self) -> usize {
+        self.total_in_flight.load(Ordering::Relaxed)
+    }
+
+    pub fn get_queue_waiting(&self) -> usize {
+        self.queue_waiting.load(Ordering::Relaxed)
+    }
+
+    pub fn get_max_total(&self) -> usize {
+        self.max_total
+    }
+
+    pub fn get_max_queue_depth(&self) -> usize {
+        self.max_queue_depth
+    }
 }
 
 pub struct RustLeaseGuard {
     account_in_flight: Arc<AtomicUsize>,
     total_in_flight: Arc<AtomicUsize>,
+    queue_semaphore: Arc<Semaphore>,
 }
 
 impl Drop for RustLeaseGuard {
     fn drop(&mut self) {
         self.account_in_flight.fetch_sub(1, Ordering::SeqCst);
         self.total_in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.queue_semaphore.add_permits(1);
     }
 }
