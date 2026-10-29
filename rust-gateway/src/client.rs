@@ -16,7 +16,10 @@ impl CloudCodeClient {
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::builder()
-                .pool_max_idle_per_host(20)
+                .pool_max_idle_per_host(100)
+                .pool_idle_timeout(std::time::Duration::from_secs(90))
+                .tcp_keepalive(std::time::Duration::from_secs(30))
+                .tcp_nodelay(true)
                 .build()
                 .unwrap(),
             refresh_mutex: Arc::new(Mutex::new(())),
@@ -62,6 +65,9 @@ impl CloudCodeClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let err_body = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 429 {
+                return Err("GOOGLE_429_RATE_LIMITED".to_string());
+            }
             return Err(format!("Google API Error {}: {}", status, err_body));
         }
 

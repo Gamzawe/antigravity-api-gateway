@@ -51,9 +51,27 @@ pub struct AccountPool {
 
 impl AccountPool {
     pub fn empty(max_per_account: usize, max_total: usize) -> Self {
+        let max_per_account: usize = std::env::var("MAX_PER_ACCOUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+
+        let max_total: usize = std::env::var("MAX_TOTAL_CONCURRENT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+
+        tracing::info!("Capacity limits: max_per_account={}, max_total={}", max_per_account, max_total);
+
         Self {
             accounts: Vec::new(),
-            client: reqwest::Client::builder().pool_max_idle_per_host(20).build().unwrap(),
+            client: reqwest::Client::builder()
+                .pool_max_idle_per_host(100)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_keepalive(Duration::from_secs(30))
+                .tcp_nodelay(true)
+                .build()
+                .unwrap(),
             total_in_flight: Arc::new(AtomicUsize::new(0)),
             max_per_account,
             max_total,
@@ -84,9 +102,27 @@ impl AccountPool {
             }
         }
 
+        let max_per_account: usize = std::env::var("MAX_PER_ACCOUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(max_per_account);
+
+        let max_total: usize = std::env::var("MAX_TOTAL_CONCURRENT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(max_total);
+
+        tracing::info!("AccountPool configured with limits: max_per_account={}, max_total={}", max_per_account, max_total);
+
         Ok(Self {
             accounts,
-            client: reqwest::Client::builder().pool_max_idle_per_host(20).build().unwrap(),
+            client: reqwest::Client::builder()
+                .pool_max_idle_per_host(100)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_keepalive(Duration::from_secs(30))
+                .tcp_nodelay(true)
+                .build()
+                .unwrap(),
             total_in_flight: Arc::new(AtomicUsize::new(0)),
             max_per_account,
             max_total,
@@ -218,6 +254,12 @@ impl AccountPool {
         };
 
         Some((chosen, guard))
+    }
+
+    pub async fn mark_rate_limited(&self, acc: &ManagedAccount, duration_secs: u64) {
+        let mut until = acc.rate_limited_until.write().await;
+        *until = Some(Instant::now() + Duration::from_secs(duration_secs));
+        tracing::warn!("Account {} marked as rate-limited for {}s", acc.email, duration_secs);
     }
 
     pub fn get_account_count(&self) -> usize {

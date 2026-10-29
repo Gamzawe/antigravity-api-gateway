@@ -40,12 +40,22 @@ async fn main() {
 
     // 1. Try loading accounts from environment variable ACCOUNTS_JSON
     // 2. Otherwise load from disk
+    let max_per_account: usize = std::env::var("MAX_PER_ACCOUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+
+    let max_total: usize = std::env::var("MAX_TOTAL_CONCURRENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+
     let pool = if let Ok(json_env) = std::env::var("ACCOUNTS_JSON") {
-        tracing::info!("Loading accounts from ACCOUNTS_JSON environment variable");
-        storage::AccountPool::load_from_json_str(&json_env, 8, 48)
+        tracing::info!("Loading accounts from ACCOUNTS_JSON environment variable (limits: {}/acc, {} total)", max_per_account, max_total);
+        storage::AccountPool::load_from_json_str(&json_env, max_per_account, max_total)
             .unwrap_or_else(|e| {
                 tracing::warn!("Failed parsing ACCOUNTS_JSON ({}). Starting in empty mode.", e);
-                storage::AccountPool::empty(8, 48)
+                storage::AccountPool::empty(max_per_account, max_total)
             })
     } else {
         let accounts_path = if std::path::Path::new("data/accounts.json").exists() {
@@ -56,10 +66,10 @@ async fn main() {
             "accounts.json"
         };
 
-        storage::AccountPool::load_from_file(accounts_path, 8, 48)
+        storage::AccountPool::load_from_file(accounts_path, max_per_account, max_total)
             .unwrap_or_else(|e| {
                 tracing::warn!("Could not load accounts file ({}). Starting in safe standby mode.", e);
-                storage::AccountPool::empty(8, 48)
+                storage::AccountPool::empty(max_per_account, max_total)
             })
     };
 
@@ -159,57 +169,85 @@ async fn chat_completions(
     let model = payload.model.unwrap_or_else(|| "gemini-3.8-flash".into());
     let canonical = constants::resolve_model(&model);
 
-    // Acquire attempt lease
-    let (account, _lease_guard) = state.pool.acquire_lease().await
-        .ok_or((axum::http::StatusCode::TOO_MANY_REQUESTS, "All accounts busy or rate-limited".into()))?;
+    // Multi-account retry loop (up to 3 attempts with automatic 429 failover)
+    let max_retries = 3;
+    let mut last_err = String::new();
 
-    // Get fresh token
-    let token = state.pool.get_token(&account).await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    for attempt in 0..max_retries {
+        // Acquire attempt lease
+        let (account, _lease_guard) = match state.pool.acquire_lease().await {
+            Some(pair) => pair,
+            None => {
+                return Err((axum::http::StatusCode::TOO_MANY_REQUESTS, "All accounts busy or rate-limited".into()));
+            }
+        };
 
-    let cloudcode_payload = converter::build_cloudcode_payload(
-        &account.project_id,
-        canonical,
-        &payload.messages,
-        payload.tools.as_ref(),
-    );
+        // Get fresh token
+        let token = match state.pool.get_token(&account).await {
+            Ok(t) => t,
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
+        };
 
-    tracing::info!(
-        "Routing completion to account: {} (model: {}, project: {}, stream: {})",
-        account.email,
-        canonical,
-        account.project_id,
-        payload.stream
-    );
+        let cloudcode_payload = converter::build_cloudcode_payload(
+            &account.project_id,
+            canonical,
+            &payload.messages,
+            payload.tools.as_ref(),
+        );
 
-    // Upstream call
-    let resp = state.client.stream_generate(
-        constants::ANTIGRAVITY_ENDPOINT_DAILY,
-        &token,
-        cloudcode_payload,
-    ).await.map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+        tracing::info!(
+            "Routing completion to account: {} (model: {}, project: {}, stream: {}, attempt: {})",
+            account.email,
+            canonical,
+            account.project_id,
+            payload.stream,
+            attempt + 1
+        );
 
-    if payload.stream {
-        let stream_ctx = Arc::new(stream::StreamContext::new(canonical.to_string()));
-        let sse_stream = stream::create_openai_sse_stream(resp, stream_ctx);
-        Ok(axum::response::sse::Sse::new(sse_stream).keep_alive(axum::response::sse::KeepAlive::default()).into_response())
-    } else {
-        let text = resp.text().await.unwrap_or_default();
-        Ok(Json(serde_json::json!({
-            "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-            "object": "chat.completion",
-            "created": chrono::Utc::now().timestamp(),
-            "model": canonical,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": text
-                },
-                "finish_reason": "stop"
-            }]
-        })).into_response())
+        // Upstream call
+        match state.client.stream_generate(
+            constants::ANTIGRAVITY_ENDPOINT_DAILY,
+            &token,
+            cloudcode_payload,
+        ).await {
+            Ok(resp) => {
+                if payload.stream {
+                    let stream_ctx = Arc::new(stream::StreamContext::new(canonical.to_string()));
+                    let sse_stream = stream::create_openai_sse_stream(resp, stream_ctx);
+                    return Ok(axum::response::sse::Sse::new(sse_stream).keep_alive(axum::response::sse::KeepAlive::default()).into_response());
+                } else {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Ok(Json(serde_json::json!({
+                        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                        "object": "chat.completion",
+                        "created": chrono::Utc::now().timestamp(),
+                        "model": canonical,
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": text
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    })).into_response());
+                }
+            }
+            Err(e) => {
+                if e == "GOOGLE_429_RATE_LIMITED" {
+                    state.pool.mark_rate_limited(&account, 15).await;
+                    last_err = "Upstream Google 429: Account temporarily backed off".into();
+                    continue;
+                }
+                last_err = e;
+            }
+        }
     }
+
+    Err((axum::http::StatusCode::BAD_GATEWAY, format!("All retry attempts exhausted: {}", last_err)))
 }
 
 // Console API Endpoints
