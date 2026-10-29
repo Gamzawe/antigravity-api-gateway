@@ -18,6 +18,14 @@ pub async fn console_handler(uri: Uri) -> Response {
         .trim_start_matches('/')
         .to_string();
 
+    if path.starts_with("api/") {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"error":{"message":"API endpoint not found"}}"#))
+            .unwrap();
+    }
+
     if path.is_empty() || path == "index.html" {
         path = "index.html".to_string();
     }

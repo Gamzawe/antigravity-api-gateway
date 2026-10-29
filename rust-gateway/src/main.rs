@@ -11,22 +11,26 @@ mod stream;
 mod console;
 
 use axum::{
+    routing::{get, post, delete},
+    Router, Json,
+    response::IntoResponse,
     extract::State,
-    routing::{get, post},
-    response::{IntoResponse, Json},
-    Router,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 pub struct AppState {
-    pub pool: storage::AccountPool,
-    pub client: client::CloudCodeClient,
+    pub pool: Arc<storage::AccountPool>,
+    pub client: Arc<client::CloudCodeClient>,
+    pub key_store: Arc<auth::KeyStore>,
 }
 
 #[tokio::main]
 async fn main() {
+    let _ = dotenvy::dotenv();
+    let _ = dotenvy::from_filename("../.env");
+
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with(tracing_subscriber::fmt::layer())
@@ -61,17 +65,38 @@ async fn main() {
 
     tracing::info!("Loaded {} active Google accounts into Rust Lease Engine", pool.get_account_count());
 
+    // Initialize KeyStore (load from data/console/access.json if exists)
+    let access_path = if std::path::Path::new("data/console/access.json").exists() {
+        Some("data/console/access.json".to_string())
+    } else if std::path::Path::new("../data/console/access.json").exists() {
+        Some("../data/console/access.json".to_string())
+    } else {
+        None
+    };
+    let key_store = Arc::new(auth::KeyStore::new(access_path));
+
     let state = Arc::new(AppState {
-        pool,
-        client: client::CloudCodeClient::new(),
+        pool: Arc::new(pool),
+        client: Arc::new(client::CloudCodeClient::new()),
+        key_store,
     });
 
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/console/api/session", get(console_session))
+        .route("/console/api/keys", get(console_list_keys).post(console_create_key))
+        .route("/console/api/keys/{id}", delete(console_revoke_key))
+        .route("/console/api/models", get(console_models))
         .route("/console", get(console::console_handler))
         .route("/console/", get(console::console_handler))
         .route("/console/{*path}", get(console::console_handler))
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
+        )
         .with_state(state);
 
     let port: u16 = std::env::var("PORT")
@@ -97,8 +122,40 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<types::ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, String)> {
+    // API Key Authentication (Optional/Enforced if keys exist or API_KEY env set)
+    let auth_header = headers.get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.trim())
+        .and_then(|h| {
+            if h.to_lowercase().starts_with("bearer ") {
+                Some(h[7..].trim())
+            } else {
+                Some(h)
+            }
+        });
+
+    let env_key = std::env::var("API_KEY").ok();
+    let has_env_key = env_key.is_some();
+    let has_store_keys = !state.key_store.list_keys().is_empty();
+
+    if has_env_key || has_store_keys {
+        let is_valid = match auth_header {
+            Some(key) => {
+                let matches_env = env_key.as_deref().map(|ek| auth::verify_api_key(key, &[ek.to_string()])).unwrap_or(false);
+                let matches_store = state.key_store.verify_key(key);
+                matches_env || matches_store
+            }
+            None => false,
+        };
+
+        if !is_valid {
+            return Err((axum::http::StatusCode::UNAUTHORIZED, "Unauthorized: Invalid or missing API key".into()));
+        }
+    }
+
     let model = payload.model.unwrap_or_else(|| "gemini-3.8-flash".into());
     let canonical = constants::resolve_model(&model);
 
@@ -152,5 +209,79 @@ async fn chat_completions(
                 "finish_reason": "stop"
             }]
         })).into_response())
+    }
+}
+
+// Console API Endpoints
+
+#[derive(serde::Deserialize)]
+struct CreateKeyReq {
+    name: Option<String>,
+}
+
+async fn console_session(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let configured = true;
+    let username = state.key_store.get_owner_username().unwrap_or_else(|| "Arafat".into());
+
+    Json(serde_json::json!({
+        "configured": configured,
+        "authenticated": true,
+        "username": username,
+        "csrf": "rust-csrf-token",
+        "apiBase": "/v1"
+    }))
+}
+
+async fn console_models() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "data": [
+            {"id": "gemini-3.8-flash", "name": "Gemini 3.8 Flash"},
+            {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro"},
+            {"id": "claude-sonnet-4-6", "name": "Claude 3.7 Sonnet"},
+            {"id": "claude-opus-4-6-thinking", "name": "Claude 3.7 Sonnet (Thinking)"}
+        ]
+    }))
+}
+
+async fn console_list_keys(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let keys = state.key_store.list_keys();
+    Json(serde_json::json!({
+        "keys": keys
+    }))
+}
+
+async fn console_create_key(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CreateKeyReq>,
+) -> impl IntoResponse {
+    let name = payload.name.unwrap_or_else(|| "default-key".into());
+    let (record, raw_key) = state.key_store.create_key(&name);
+
+    Json(serde_json::json!({
+        "id": record.id,
+        "name": record.name,
+        "prefix": record.prefix,
+        "createdAt": record.created_at,
+        "lastUsedAt": record.last_used_at,
+        "revokedAt": record.revoked_at,
+        "key": raw_key
+    }))
+}
+
+async fn console_revoke_key(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(record) = state.key_store.revoke_key(&id) {
+        Json(serde_json::json!({
+            "id": record.id,
+            "name": record.name,
+            "prefix": record.prefix,
+            "createdAt": record.created_at,
+            "lastUsedAt": record.last_used_at,
+            "revokedAt": record.revoked_at
+        })).into_response()
+    } else {
+        (axum::http::StatusCode::NOT_FOUND, "Key not found").into_response()
     }
 }
