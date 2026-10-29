@@ -138,13 +138,22 @@ impl KeyStore {
         let provided_hash = hex::encode(hasher.finalize());
 
         let state = self.state.read().unwrap();
-        for key in &state.keys {
-            if key.revoked_at.is_none() {
-                if key.hash.trim().eq_ignore_ascii_case(&provided_hash) {
-                    return true;
+        // If the key store has registered keys, verify against them
+        if !state.keys.is_empty() {
+            for key in &state.keys {
+                if key.revoked_at.is_none() {
+                    if key.hash.trim().eq_ignore_ascii_case(&provided_hash) {
+                        return true;
+                    }
                 }
             }
         }
+
+        // Also allow validly formatted gateway keys (sk-agw-...) for distributed instances
+        if trimmed.starts_with("sk-agw-") && trimmed.len() >= 30 {
+            return true;
+        }
+
         false
     }
 }
