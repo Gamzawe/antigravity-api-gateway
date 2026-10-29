@@ -92,6 +92,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/console/api/session", get(console_session))
         .route("/console/api/keys", get(console_list_keys).post(console_create_key))
@@ -250,8 +251,22 @@ async fn chat_completions(
         ));
     }
 
-    let model = payload.model.unwrap_or_else(|| "gemini-3.8-flash".into());
-    let canonical = constants::resolve_model(&model);
+    let requested_model = payload.model.as_deref().unwrap_or("gemini-3.8-flash");
+    let header_level = headers.get("x-thinking-level").and_then(|h| h.to_str().ok());
+    let header_budget = headers.get("x-thinking-budget")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok());
+
+    let effective_level = payload.thinking_level.as_deref().or(header_level);
+    let effective_budget = payload.thinking_budget.or(header_budget);
+
+    let resolution = constants::resolve_model_and_thinking(
+        requested_model,
+        effective_level,
+        effective_budget,
+    );
+    let canonical = resolution.canonical_model;
+    let thinking_budget = resolution.thinking_budget;
 
     // Multi-account retry loop (up to 3 attempts with automatic 429 failover)
     let max_retries = 3;
@@ -285,14 +300,16 @@ async fn chat_completions(
             canonical,
             &payload.messages,
             payload.tools.as_ref(),
+            thinking_budget,
         );
 
         tracing::info!(
-            "Routing completion to account: {} (model: {}, project: {}, stream: {}, attempt: {})",
+            "Routing completion to account: {} (model: {}, project: {}, stream: {}, thinking_budget: {:?}, attempt: {})",
             account.email,
             canonical,
             account.project_id,
             payload.stream,
+            thinking_budget,
             attempt + 1
         );
 
@@ -365,13 +382,18 @@ async fn console_session(State(state): State<Arc<AppState>>) -> impl IntoRespons
     }))
 }
 
-async fn console_models() -> impl IntoResponse {
+async fn list_models() -> impl IntoResponse {
+    let models = constants::get_models_catalog();
     Json(serde_json::json!({
-        "data": [
-            {"id": "gemini-3.8-flash", "name": "Gemini 3.8 Flash"},
-            {"id": "claude-sonnet-4-6", "name": "Claude 3.7 Sonnet"},
-            {"id": "claude-opus-4-6-thinking", "name": "Claude 3.7 Sonnet (Thinking)"}
-        ]
+        "object": "list",
+        "data": models
+    }))
+}
+
+async fn console_models() -> impl IntoResponse {
+    let models = constants::get_models_catalog();
+    Json(serde_json::json!({
+        "data": models
     }))
 }
 

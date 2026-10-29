@@ -102,6 +102,7 @@ pub fn build_cloudcode_payload(
     model: &str,
     messages: &[ChatMessage],
     tools: Option<&Value>,
+    thinking_budget: Option<i64>,
 ) -> Value {
     let (system_instruction, contents) = convert_messages_to_google(messages);
 
@@ -111,6 +112,14 @@ pub fn build_cloudcode_payload(
 
     if let Some(sys) = system_instruction {
         request_obj["systemInstruction"] = sys;
+    }
+
+    if let Some(budget) = thinking_budget {
+        request_obj["generationConfig"] = json!({
+            "thinkingConfig": {
+                "thinkingBudget": budget
+            }
+        });
     }
 
     if let Some(tool_defs) = tools {

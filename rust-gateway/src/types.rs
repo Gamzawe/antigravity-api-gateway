@@ -27,6 +27,10 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
