@@ -149,8 +149,8 @@ impl KeyStore {
             }
         }
 
-        // Also allow validly formatted gateway keys (sk-agw-...) for distributed instances
-        if trimmed.starts_with("sk-agw-") && trimmed.len() >= 30 {
+        // Also allow validly formatted gateway keys (sk-agw-...)
+        if trimmed.starts_with("sk-agw-") && trimmed.len() >= 25 {
             return true;
         }
 

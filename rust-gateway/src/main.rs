@@ -158,8 +158,8 @@ async fn chat_completions(
     let has_env_key = env_key.is_some();
     let has_store_keys = !state.key_store.list_keys().is_empty();
 
-    if has_env_key || has_store_keys {
-        let is_valid = match auth_header {
+    let is_authorized = if has_env_key || has_store_keys {
+        match auth_header {
             Some(key) => {
                 let matches_env = env_key.as_deref().map(|ek| {
                     let keys: Vec<String> = ek.split(',').map(|s| s.trim().to_string()).collect();
@@ -169,11 +169,14 @@ async fn chat_completions(
                 matches_env || matches_store
             }
             None => false,
-        };
-
-        if !is_valid {
-            return Err((axum::http::StatusCode::UNAUTHORIZED, "Unauthorized: Invalid or missing API key".into()));
         }
+    } else {
+        true
+    };
+
+    if !is_authorized {
+        tracing::warn!("Rejecting unauthorized request: auth_present={}", auth_header.is_some());
+        return Err((axum::http::StatusCode::UNAUTHORIZED, "Unauthorized: Invalid or missing API key".into()));
     }
 
     let model = payload.model.unwrap_or_else(|| "gemini-3.8-flash".into());
