@@ -115,11 +115,13 @@ pub fn build_cloudcode_payload(
     }
 
     if let Some(budget) = thinking_budget {
-        request_obj["generationConfig"] = json!({
-            "thinkingConfig": {
-                "thinkingBudget": budget
-            }
-        });
+        if !model.starts_with("claude-") {
+            request_obj["generationConfig"] = json!({
+                "thinkingConfig": {
+                    "thinkingBudget": budget
+                }
+            });
+        }
     }
 
     if let Some(tool_defs) = tools {

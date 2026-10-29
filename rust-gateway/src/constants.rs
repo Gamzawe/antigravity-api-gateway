@@ -66,7 +66,7 @@ pub fn resolve_model_and_thinking(
     let canonical = if lower.contains("claude-opus") || lower.contains("opus-4-6") {
         "claude-opus-4-6-thinking"
     } else if lower.contains("claude") || lower.contains("sonnet") {
-        if resolved_budget.is_some() && resolved_budget.unwrap_or(0) > 8192 {
+        if lower.contains("thinking") || (resolved_budget.is_some() && resolved_budget.unwrap_or(0) > 0) {
             "claude-opus-4-6-thinking"
         } else {
             "claude-sonnet-4-6"
