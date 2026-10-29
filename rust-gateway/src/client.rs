@@ -1,8 +1,6 @@
 //! Google CloudCode Client & Full Streaming Forwarder with Framing Guard
 
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, ACCEPT};
-use futures_util::StreamExt;
-use eventsource_stream::Eventsource;
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use serde_json::Value;

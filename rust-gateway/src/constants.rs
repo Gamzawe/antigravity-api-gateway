@@ -1,4 +1,5 @@
 //! Antigravity Constants & Canonical Model Definitions
+#![allow(dead_code)]
 
 pub const DEFAULT_PORT: u16 = 8089;
 pub const ANTIGRAVITY_ENDPOINT_DAILY: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";

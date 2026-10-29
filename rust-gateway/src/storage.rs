@@ -1,7 +1,6 @@
 //! Thread-Safe Account Pool, Storage Loader & Live OAuth2 Refresh
 
 use std::sync::Arc;
-use std::collections::HashMap;
 use std::time::{Instant, Duration};
 use tokio::sync::{RwLock, Mutex, Semaphore};
 use serde::{Deserialize, Serialize};
@@ -54,7 +53,7 @@ pub struct AccountPool {
 }
 
 impl AccountPool {
-    pub fn empty(max_per_account: usize, max_total: usize) -> Self {
+    pub fn empty(_max_per_account: usize, _max_total: usize) -> Self {
         let max_per_account: usize = std::env::var("MAX_PER_ACCOUNT")
             .ok()
             .and_then(|v| v.parse().ok())

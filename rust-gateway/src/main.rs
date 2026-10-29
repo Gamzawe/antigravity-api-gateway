@@ -2,7 +2,6 @@
 
 mod constants;
 mod types;
-mod lease;
 mod auth;
 mod client;
 mod converter;

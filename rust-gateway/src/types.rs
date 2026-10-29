@@ -1,4 +1,5 @@
 //! OpenAI, Anthropic, and Google CloudCode Schema Types
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 

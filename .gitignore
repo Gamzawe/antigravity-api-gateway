@@ -13,4 +13,5 @@ tests/fixtures/empty.json
 .unlazy/
 *.pyc
 __pycache__/
+target/
 rust-gateway/target/
