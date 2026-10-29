@@ -133,12 +133,73 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }))
 }
 
+fn openai_error_response(status: axum::http::StatusCode, message: &str, err_type: &str, code: &str) -> axum::response::Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": err_type,
+            "code": code
+        }
+    });
+    (status, Json(body)).into_response()
+}
+
+fn extract_clean_text_from_sse(raw_sse: &str) -> String {
+    let mut full_text = String::new();
+    for line in raw_sse.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("data:") {
+            continue;
+        }
+        let json_part = trimmed[5..].trim();
+        if json_part.is_empty() || json_part == "[DONE]" {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_part) {
+            if let Some(candidates) = val.pointer("/response/candidates").and_then(|c| c.as_array()) {
+                for candidate in candidates {
+                    if let Some(parts) = candidate.pointer("/content/parts").and_then(|p| p.as_array()) {
+                        for part in parts {
+                            if part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false) {
+                                continue;
+                            }
+                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                full_text.push_str(text);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if full_text.is_empty() {
+        if raw_sse.starts_with("data:") {
+            raw_sse.trim_start_matches("data:").trim().to_string()
+        } else {
+            raw_sse.to_string()
+        }
+    } else {
+        full_text
+    }
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Json(payload): Json<types::ChatCompletionRequest>,
-) -> Result<impl IntoResponse, (axum::http::StatusCode, String)> {
-    // API Key Authentication (Optional/Enforced if keys exist or API_KEY env set)
+) -> Result<impl IntoResponse, axum::response::Response> {
+    // 1. Edge input validation
+    if payload.messages.is_empty() {
+        return Err(openai_error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "The 'messages' array must contain at least one message.",
+            "invalid_request_error",
+            "empty_messages",
+        ));
+    }
+
+    // 2. API Key Authentication (Strict by default, require ALLOW_ANONYMOUS=true for open mode)
     let auth_header = headers.get(axum::http::header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .map(|h| h.trim())
@@ -158,10 +219,14 @@ async fn chat_completions(
     let env_key = std::env::var("API_KEY")
         .or_else(|_| std::env::var("API_KEYS"))
         .ok();
-    let has_env_key = env_key.is_some();
-    let has_store_keys = !state.key_store.list_keys().is_empty();
 
-    let is_authorized = if has_env_key || has_store_keys {
+    let allow_anonymous = std::env::var("ALLOW_ANONYMOUS")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    let is_authorized = if allow_anonymous {
+        true
+    } else {
         match auth_header {
             Some(key) => {
                 let matches_env = env_key.as_deref().map(|ek| {
@@ -173,13 +238,16 @@ async fn chat_completions(
             }
             None => false,
         }
-    } else {
-        true
     };
 
     if !is_authorized {
         tracing::warn!("Rejecting unauthorized request: auth_present={}", auth_header.is_some());
-        return Err((axum::http::StatusCode::UNAUTHORIZED, "Unauthorized: Invalid or missing API key".into()));
+        return Err(openai_error_response(
+            axum::http::StatusCode::UNAUTHORIZED,
+            "Provide a valid API key using Authorization: Bearer <key> or x-api-key header.",
+            "authentication_error",
+            "invalid_api_key",
+        ));
     }
 
     let model = payload.model.unwrap_or_else(|| "gemini-3.8-flash".into());
@@ -194,7 +262,12 @@ async fn chat_completions(
         let (account, _lease_guard) = match state.pool.acquire_lease().await {
             Some(pair) => pair,
             None => {
-                return Err((axum::http::StatusCode::TOO_MANY_REQUESTS, "All accounts busy or rate-limited".into()));
+                return Err(openai_error_response(
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    "All accounts busy or rate-limited. Gateway queue full.",
+                    "rate_limit_error",
+                    "rate_limit_exceeded",
+                ));
             }
         };
 
@@ -235,7 +308,8 @@ async fn chat_completions(
                     let sse_stream = stream::create_openai_sse_stream(resp, stream_ctx);
                     return Ok(axum::response::sse::Sse::new(sse_stream).keep_alive(axum::response::sse::KeepAlive::default()).into_response());
                 } else {
-                    let text = resp.text().await.unwrap_or_default();
+                    let raw_text = resp.text().await.unwrap_or_default();
+                    let clean_text = extract_clean_text_from_sse(&raw_text);
                     return Ok(Json(serde_json::json!({
                         "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
                         "object": "chat.completion",
@@ -245,7 +319,7 @@ async fn chat_completions(
                             "index": 0,
                             "message": {
                                 "role": "assistant",
-                                "content": text
+                                "content": clean_text
                             },
                             "finish_reason": "stop"
                         }]
@@ -263,7 +337,12 @@ async fn chat_completions(
         }
     }
 
-    Err((axum::http::StatusCode::BAD_GATEWAY, format!("All retry attempts exhausted: {}", last_err)))
+    Err(openai_error_response(
+        axum::http::StatusCode::BAD_GATEWAY,
+        &format!("All retry attempts exhausted: {}", last_err),
+        "api_error",
+        "upstream_error",
+    ))
 }
 
 // Console API Endpoints
