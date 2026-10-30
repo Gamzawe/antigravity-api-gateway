@@ -15,8 +15,18 @@ pub struct KeyRecord {
     pub created_at: String,
     #[serde(rename = "lastUsedAt")]
     pub last_used_at: Option<String>,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: Option<String>,
     #[serde(rename = "revokedAt")]
     pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyVerification {
+    Valid,
+    Revoked,
+    Expired,
+    NotFound,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +54,9 @@ pub struct KeyStore {
 impl KeyStore {
     pub fn new(file_path: Option<String>) -> Self {
         let initial_state = if let Some(ref path) = file_path {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             if let Ok(content) = std::fs::read_to_string(path) {
                 serde_json::from_str(&content).unwrap_or(AccessState {
                     version: 1,
@@ -83,7 +96,7 @@ impl KeyStore {
         self.state.read().unwrap().keys.clone()
     }
 
-    pub fn create_key(&self, name: &str) -> (KeyRecord, String) {
+    pub fn create_key(&self, name: &str, expires_at: Option<String>) -> (KeyRecord, String) {
         use rand::Rng;
         let mut rng = rand::thread_rng();
         let random_bytes: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
@@ -104,6 +117,7 @@ impl KeyStore {
             hash,
             created_at: now_str,
             last_used_at: None,
+            expires_at,
             revoked_at: None,
         };
 
@@ -131,30 +145,83 @@ impl KeyStore {
         None
     }
 
-    pub fn verify_key(&self, provided_key: &str) -> bool {
+    pub fn delete_key(&self, id: &str) -> Option<KeyRecord> {
+        let mut state = self.state.write().unwrap();
+        if let Some(pos) = state.keys.iter().position(|k| k.id == id) {
+            let removed = state.keys.remove(pos);
+            if let Some(ref path) = self.file_path {
+                let _ = std::fs::write(path, serde_json::to_string_pretty(&*state).unwrap_or_default());
+            }
+            return Some(removed);
+        }
+        None
+    }
+
+    pub fn update_key(
+        &self,
+        id: &str,
+        name: Option<String>,
+        expires_at: Option<Option<String>>,
+        unrevoke: bool,
+    ) -> Option<KeyRecord> {
+        let mut state = self.state.write().unwrap();
+        if let Some(record) = state.keys.iter_mut().find(|k| k.id == id) {
+            if let Some(n) = name {
+                if !n.trim().is_empty() {
+                    record.name = n.trim().to_string();
+                }
+            }
+            if let Some(exp) = expires_at {
+                record.expires_at = exp;
+            }
+            if unrevoke {
+                record.revoked_at = None;
+            }
+            let updated = record.clone();
+            if let Some(ref path) = self.file_path {
+                let _ = std::fs::write(path, serde_json::to_string_pretty(&*state).unwrap_or_default());
+            }
+            return Some(updated);
+        }
+        None
+    }
+
+    pub fn verify_key(&self, provided_key: &str) -> KeyVerification {
         let trimmed = provided_key.trim();
         let mut hasher = Sha256::new();
         hasher.update(trimmed.as_bytes());
         let provided_hash = hex::encode(hasher.finalize());
 
-        let state = self.state.read().unwrap();
-        // If the key store has registered keys, verify against them
-        if !state.keys.is_empty() {
-            for key in &state.keys {
-                if key.revoked_at.is_none() {
-                    if key.hash.trim().eq_ignore_ascii_case(&provided_hash) {
-                        return true;
+        let mut state = self.state.write().unwrap();
+        let now = chrono::Utc::now();
+
+        for key in &mut state.keys {
+            if key.hash.trim().eq_ignore_ascii_case(&provided_hash) {
+                // 1. Check if revoked
+                if key.revoked_at.is_some() {
+                    return KeyVerification::Revoked;
+                }
+
+                // 2. Check if expired
+                if let Some(ref exp_str) = key.expires_at {
+                    if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(exp_str) {
+                        if now > exp_dt {
+                            return KeyVerification::Expired;
+                        }
+                    } else if let Ok(exp_date) = chrono::NaiveDate::parse_from_str(exp_str, "%Y-%m-%d") {
+                        if now.date_naive() > exp_date {
+                            return KeyVerification::Expired;
+                        }
                     }
                 }
+
+                // 3. Valid key! Update last_used_at
+                key.last_used_at = Some(now.to_rfc3339());
+                return KeyVerification::Valid;
             }
         }
 
-        // Also allow validly formatted gateway keys (sk-agw-...)
-        if trimmed.starts_with("sk-agw-") && trimmed.len() >= 25 {
-            return true;
-        }
-
-        false
+        KeyVerification::NotFound
     }
 }
 
