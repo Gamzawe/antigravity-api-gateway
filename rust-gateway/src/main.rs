@@ -188,19 +188,9 @@ fn extract_clean_text_from_sse(raw_sse: &str) -> String {
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    Json(payload): Json<types::ChatCompletionRequest>,
+    payload_result: Result<Json<types::ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<impl IntoResponse, axum::response::Response> {
-    // 1. Edge input validation
-    if payload.messages.is_empty() {
-        return Err(openai_error_response(
-            axum::http::StatusCode::BAD_REQUEST,
-            "The 'messages' array must contain at least one message.",
-            "invalid_request_error",
-            "empty_messages",
-        ));
-    }
-
-    // 2. API Key Authentication (Strict by default, require ALLOW_ANONYMOUS=true for open mode)
+    // 1. API Key Authentication (Strict by default, require ALLOW_ANONYMOUS=true for open mode)
     let auth_header = headers.get(axum::http::header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .map(|h| h.trim())
@@ -226,7 +216,7 @@ async fn chat_completions(
         .unwrap_or(false);
 
     let mut auth_error_code = "invalid_api_key";
-    let mut auth_error_msg = "Provide a valid API key using Authorization: Bearer <key> or x-api-key header.";
+    let mut auth_error_msg = "Provide a valid API key using Authorization: Bearer *** or x-api-key header.";
 
     let is_authorized = if allow_anonymous {
         true
@@ -268,6 +258,52 @@ async fn chat_completions(
             auth_error_msg,
             "authentication_error",
             auth_error_code,
+        ));
+    }
+
+    // 2. Body parsing and schema validation
+    let Json(payload) = match payload_result {
+        Ok(json) => json,
+        Err(rejection) => {
+            let msg = format!("Invalid request payload: {}", rejection.body_text());
+            return Err(openai_error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                &msg,
+                "invalid_request_error",
+                "invalid_payload",
+            ));
+        }
+    };
+
+    // 3. Messages array validation
+    if payload.messages.is_empty() {
+        return Err(openai_error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "The 'messages' array must contain at least one message.",
+            "invalid_request_error",
+            "empty_messages",
+        ));
+    }
+
+    let has_valid_content = payload.messages.iter().any(|m| {
+        let has_text = match &m.content {
+            serde_json::Value::String(s) => !s.trim().is_empty(),
+            serde_json::Value::Array(arr) => !arr.is_empty(),
+            _ => false,
+        };
+        let has_tools = m.tool_calls.as_ref()
+            .and_then(|tc| tc.as_array())
+            .map(|arr| !arr.is_empty())
+            .unwrap_or(false);
+        has_text || has_tools
+    });
+
+    if !has_valid_content {
+        return Err(openai_error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "Message content cannot be empty. Please provide text or tool calls.",
+            "invalid_request_error",
+            "empty_content",
         ));
     }
 
