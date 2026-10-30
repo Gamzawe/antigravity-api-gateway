@@ -12,6 +12,7 @@ pub struct StreamContext {
     pub stream_id: String,
     pub model: String,
     pub downstream_committed: Arc<AtomicBool>,
+    pub tool_counter: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StreamContext {
@@ -20,6 +21,7 @@ impl StreamContext {
             stream_id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             model,
             downstream_committed: Arc::new(AtomicBool::new(false)),
+            tool_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -35,65 +37,74 @@ pub fn process_google_sse_chunk(
         return events;
     };
 
-    // Google CloudCode payload schema: response.candidates[0].content.parts
-    let parts_opt = val
+    // Google CloudCode payload schema: response.candidates OR candidates
+    let candidates = val
         .get("response")
         .and_then(|r| r.get("candidates"))
-        .and_then(|c| c.as_array())
-        .and_then(|arr| arr.get(0))
-        .and_then(|cand| cand.get("content"))
-        .and_then(|cont| cont.get("parts"))
-        .and_then(|p| p.as_array());
+        .or_else(|| val.get("candidates"))
+        .and_then(|c| c.as_array());
 
-    if let Some(parts) = parts_opt {
-        for part in parts {
-            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                if !text.is_empty() {
-                    ctx.downstream_committed.store(true, Ordering::SeqCst);
-                    let payload = json!({
-                        "id": ctx.stream_id,
-                        "object": "chat.completion.chunk",
-                        "created": chrono::Utc::now().timestamp(),
-                        "model": ctx.model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": { "content": text },
-                            "finish_reason": null
-                        }]
-                    });
-                    let data_str = payload.to_string();
-                    events.push((Event::default().data(data_str.clone()), format!("data: {}\n\n", data_str)));
-                }
-            }
+    if let Some(cands) = candidates {
+        for (cand_idx, cand) in cands.iter().enumerate() {
+            if let Some(parts) = cand.pointer("/content/parts").and_then(|p| p.as_array()) {
+                for part in parts {
+                    let is_thought = part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
 
-            // Function call handling
-            if let Some(fc) = part.get("functionCall") {
-                ctx.downstream_committed.store(true, Ordering::SeqCst);
-                let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                let args = fc.get("args").cloned().unwrap_or(json!({}));
-                let payload = json!({
-                    "id": ctx.stream_id,
-                    "object": "chat.completion.chunk",
-                    "created": chrono::Utc::now().timestamp(),
-                    "model": ctx.model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "tool_calls": [{
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        if !text.is_empty() {
+                            ctx.downstream_committed.store(true, Ordering::SeqCst);
+                            let delta = if is_thought {
+                                json!({ "reasoning_content": text })
+                            } else {
+                                json!({ "content": text })
+                            };
+                            let payload = json!({
+                                "id": ctx.stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": chrono::Utc::now().timestamp(),
+                                "model": ctx.model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": delta,
+                                    "finish_reason": null
+                                }]
+                            });
+                            let data_str = payload.to_string();
+                            events.push((Event::default().data(data_str.clone()), format!("data: {}\n\n", data_str)));
+                        }
+                    }
+
+                    // Function call handling
+                    if let Some(fc) = part.get("functionCall") {
+                        ctx.downstream_committed.store(true, Ordering::SeqCst);
+                        let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                        let args = fc.get("args").cloned().unwrap_or(json!({}));
+                        let tool_idx = ctx.tool_counter.fetch_add(1, Ordering::SeqCst);
+                        let payload = json!({
+                            "id": ctx.stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": chrono::Utc::now().timestamp(),
+                            "model": ctx.model,
+                            "choices": [{
                                 "index": 0,
-                                "id": format!("call_{}", uuid::Uuid::new_v4().simple()),
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": args.to_string()
-                                }
+                                "delta": {
+                                    "tool_calls": [{
+                                        "index": tool_idx,
+                                        "id": format!("call_{}_{}", cand_idx, tool_idx),
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": args.to_string()
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
                             }]
-                        },
-                        "finish_reason": "tool_calls"
-                    }]
-                });
-                let data_str = payload.to_string();
-                events.push((Event::default().data(data_str.clone()), format!("data: {}\n\n", data_str)));
+                        });
+                        let data_str = payload.to_string();
+                        events.push((Event::default().data(data_str.clone()), format!("data: {}\n\n", data_str)));
+                    }
+                }
             }
         }
     }
@@ -138,5 +149,31 @@ pub fn create_openai_sse_stream(
         }
 
         yield Ok(Event::default().data("[DONE]"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_process_google_sse_chunk_streaming_tools_and_thoughts() {
+        let ctx = StreamContext::new("antigravity-gemini-3.8-flash".to_string());
+        
+        let chunk_json = r#"{"response": {"candidates": [{"content": {"role": "model","parts": [{"thought": true, "text": "Analyzing the codebase..."},{"thoughtSignature": "sig123","functionCall": {"name": "search_files","args": {"pattern": "*kiosk*"}}}]}}]}}"#;
+
+        let events = process_google_sse_chunk(&ctx, chunk_json);
+        assert_eq!(events.len(), 2);
+
+        // Event 0: Reasoning delta
+        let ev0_val: Value = serde_json::from_str(&events[0].1.trim_start_matches("data:").trim()).unwrap();
+        assert_eq!(ev0_val["choices"][0]["delta"]["reasoning_content"], "Analyzing the codebase...");
+        assert!(ev0_val["choices"][0]["delta"]["content"].is_null());
+
+        // Event 1: Tool call delta
+        let ev1_val: Value = serde_json::from_str(&events[1].1.trim_start_matches("data:").trim()).unwrap();
+        assert_eq!(ev1_val["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "search_files");
+        assert_eq!(ev1_val["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+        assert_eq!(ev1_val["choices"][0]["finish_reason"], "tool_calls");
     }
 }

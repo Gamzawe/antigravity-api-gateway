@@ -174,45 +174,7 @@ fn openai_error_response(status: axum::http::StatusCode, message: &str, err_type
     (status, Json(body)).into_response()
 }
 
-fn extract_clean_text_from_sse(raw_sse: &str) -> String {
-    let mut full_text = String::new();
-    for line in raw_sse.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("data:") {
-            continue;
-        }
-        let json_part = trimmed[5..].trim();
-        if json_part.is_empty() || json_part == "[DONE]" {
-            continue;
-        }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_part) {
-            if let Some(candidates) = val.pointer("/response/candidates").and_then(|c| c.as_array()) {
-                for candidate in candidates {
-                    if let Some(parts) = candidate.pointer("/content/parts").and_then(|p| p.as_array()) {
-                        for part in parts {
-                            if part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false) {
-                                continue;
-                            }
-                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                full_text.push_str(text);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 
-    if full_text.is_empty() {
-        if raw_sse.starts_with("data:") {
-            raw_sse.trim_start_matches("data:").trim().to_string()
-        } else {
-            raw_sse.to_string()
-        }
-    } else {
-        full_text
-    }
-}
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
@@ -481,7 +443,22 @@ async fn chat_completions(
                     return Ok(sse_resp);
                 } else {
                     let raw_text = resp.text().await.unwrap_or_default();
-                    let clean_text = extract_clean_text_from_sse(&raw_text);
+                    let extracted = converter::extract_non_streaming_from_sse(&raw_text);
+
+                    let mut message = serde_json::json!({
+                        "role": "assistant"
+                    });
+                    if let Some(content) = extracted.content {
+                        message["content"] = serde_json::Value::String(content);
+                    } else {
+                        message["content"] = serde_json::Value::Null;
+                    }
+                    if let Some(reasoning) = extracted.reasoning_content {
+                        message["reasoning_content"] = serde_json::Value::String(reasoning);
+                    }
+                    if let Some(tool_calls) = extracted.tool_calls {
+                        message["tool_calls"] = serde_json::Value::Array(tool_calls);
+                    }
 
                     let json_body = serde_json::json!({
                         "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -490,11 +467,8 @@ async fn chat_completions(
                         "model": canonical,
                         "choices": [{
                             "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": clean_text
-                            },
-                            "finish_reason": "stop"
+                            "message": message,
+                            "finish_reason": extracted.finish_reason
                         }]
                     });
 
