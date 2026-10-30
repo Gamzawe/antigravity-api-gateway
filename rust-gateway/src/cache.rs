@@ -143,10 +143,12 @@ impl ResponseCache {
         messages: &serde_json::Value,
         tools: Option<&serde_json::Value>,
         thinking_budget: Option<i64>,
+        stream: bool,
     ) -> String {
         let mut hasher = Sha256::new();
         hasher.update(canonical_model.as_bytes());
         hasher.update(b"|");
+        hasher.update(if stream { b"stream:1|" } else { b"stream:0|" });
         
         let normalized_messages = Self::normalize_messages(messages);
         if let Ok(serialized) = serde_json::to_vec(&normalized_messages) {

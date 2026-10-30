@@ -333,6 +333,7 @@ async fn chat_completions(
             &messages_val,
             payload.tools.as_ref(),
             thinking_budget,
+            payload.stream,
         ))
     } else {
         None
@@ -340,9 +341,9 @@ async fn chat_completions(
 
     if let Some(ref key) = cache_key {
         if let Some(entry) = state.cache.get(key).await {
-            tracing::info!("Cache HIT for key: {} (model: {}, stream: {})", key, canonical, payload.stream);
-            match entry.payload {
-                cache::CachedPayload::Json(bytes) => {
+            match (entry.payload, payload.stream) {
+                (cache::CachedPayload::Json(bytes), false) => {
+                    tracing::info!("Cache HIT for key: {} (model: {}, stream: false)", key, canonical);
                     let resp = axum::response::Response::builder()
                         .status(axum::http::StatusCode::OK)
                         .header(axum::http::header::CONTENT_TYPE, "application/json")
@@ -352,7 +353,8 @@ async fn chat_completions(
                         .unwrap();
                     return Ok(resp);
                 }
-                cache::CachedPayload::Sse(bytes) => {
+                (cache::CachedPayload::Sse(bytes), true) => {
+                    tracing::info!("Cache HIT for key: {} (model: {}, stream: true)", key, canonical);
                     let resp = axum::response::Response::builder()
                         .status(axum::http::StatusCode::OK)
                         .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
@@ -362,6 +364,9 @@ async fn chat_completions(
                         .body(axum::body::Body::from(bytes))
                         .unwrap();
                     return Ok(resp);
+                }
+                _ => {
+                    tracing::warn!("Cache payload mismatch for key: {} (requested stream: {}) - treating as MISS", key, payload.stream);
                 }
             }
         }
