@@ -405,13 +405,24 @@ async fn chat_completions(
         }
     }
 
+    // Compute Prefix-Affinity seed: hash of the initial system prompt or first user message
+    // This pins subsequent turns of an evolving agent conversation to the SAME upstream account
+    // so Google's server-side KV-cache (PagedAttention) hits automatically across turns!
+    let affinity_seed: Option<u64> = payload.messages.first().map(|m| {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        m.role.hash(&mut hasher);
+        m.content.to_string().hash(&mut hasher);
+        hasher.finish()
+    });
+
     // Multi-account retry loop (up to 3 attempts with automatic 429 failover)
     let max_retries = 3;
     let mut last_err = String::new();
 
     for attempt in 0..max_retries {
-        // Acquire attempt lease
-        let (account, _lease_guard) = match state.pool.acquire_lease().await {
+        // Acquire attempt lease with prefix affinity
+        let (account, _lease_guard) = match state.pool.acquire_lease_with_affinity(affinity_seed).await {
             Some(pair) => pair,
             None => {
                 return Err(openai_error_response(

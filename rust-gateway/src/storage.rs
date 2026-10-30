@@ -260,8 +260,15 @@ impl Drop for QueueWaitingGuard {
 }
 
 impl AccountPool {
-    /// Acquire attempt lease with Tokio FIFO fair queuing
+    /// Acquire attempt lease with optional Prefix-Affinity routing
     pub async fn acquire_lease(&self) -> Option<(Arc<ManagedAccount>, RustLeaseGuard)> {
+        self.acquire_lease_with_affinity(None).await
+    }
+
+    /// Acquire attempt lease with deterministic prefix affinity
+    /// If an affinity seed is provided (hash of stable conversation prefix or session),
+    /// the pool attempts to route to the designated account to maximize Google KV-cache hits.
+    pub async fn acquire_lease_with_affinity(&self, affinity_hash: Option<u64>) -> Option<(Arc<ManagedAccount>, RustLeaseGuard)> {
         // 1. Fast-path backpressure: if waiting queue buffer is full, shed load immediately
         if self.queue_waiting.load(Ordering::Relaxed) >= self.max_queue_depth {
             tracing::warn!("FIFO queue buffer full ({}/{}), rejecting burst", self.queue_waiting.load(Ordering::Relaxed), self.max_queue_depth);
@@ -288,11 +295,11 @@ impl AccountPool {
             }
         };
 
-        // 4. Select least-loaded account (< max_per_account and not rate limited)
+        // 4. Select candidate accounts (< max_per_account and not rate limited)
         let now = Instant::now();
-        let mut candidates = Vec::new();
+        let mut available_indices = Vec::new();
 
-        for acc in &self.accounts {
+        for (idx, acc) in self.accounts.iter().enumerate() {
             if !acc.enabled { continue; }
             if let Some(until) = *acc.rate_limited_until.read().await {
                 if until > now { continue; }
@@ -300,23 +307,33 @@ impl AccountPool {
             let inf = acc.in_flight.load(Ordering::SeqCst);
             if inf >= self.max_per_account { continue; }
 
-            let frac = *acc.remaining_fraction.read().await;
-            let last = *acc.last_used.read().await;
-            candidates.push((acc.clone(), inf, frac, last));
+            available_indices.push(idx);
         }
 
-        if candidates.is_empty() {
+        if available_indices.is_empty() {
             // Permit is dropped here automatically if no account is ready
             return None;
         }
 
-        candidates.sort_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-                .then(a.3.cmp(&b.3))
-        });
+        // Prefix-Affinity Selection: if caller provides affinity hash, target that account first
+        let chosen_idx = if let Some(hash) = affinity_hash {
+            let preferred_idx = (hash as usize) % self.accounts.len();
+            if available_indices.contains(&preferred_idx) {
+                preferred_idx
+            } else {
+                // Preferred account busy/rate-limited: fall back to least-loaded candidate
+                *available_indices.iter().min_by_key(|&&idx| {
+                    self.accounts[idx].in_flight.load(Ordering::SeqCst)
+                }).unwrap_or(&available_indices[0])
+            }
+        } else {
+            // No affinity: select least-loaded candidate
+            *available_indices.iter().min_by_key(|&&idx| {
+                self.accounts[idx].in_flight.load(Ordering::SeqCst)
+            }).unwrap_or(&available_indices[0])
+        };
 
-        let (chosen, _, _, _) = candidates.remove(0);
+        let chosen = self.accounts[chosen_idx].clone();
         chosen.in_flight.fetch_add(1, Ordering::SeqCst);
         self.total_in_flight.fetch_add(1, Ordering::SeqCst);
         *chosen.last_used.write().await = Instant::now();

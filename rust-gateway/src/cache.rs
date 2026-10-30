@@ -105,6 +105,38 @@ impl ResponseCache {
         tracing::info!("In-Memory Cache purged successfully via administrative action");
     }
 
+    /// Normalizes messages by sorting keys and stripping volatile ephemeral noise
+    pub fn normalize_messages(messages: &serde_json::Value) -> serde_json::Value {
+        match messages {
+            serde_json::Value::Array(arr) => {
+                let cleaned: Vec<serde_json::Value> = arr.iter().map(|msg| {
+                    if let serde_json::Value::Object(map) = msg {
+                        let mut sorted_map = serde_json::Map::new();
+                        // Sort keys and cleanse volatile headers if string
+                        for (k, v) in map {
+                            if k == "content" {
+                                if let serde_json::Value::String(s) = v {
+                                    // Normalize line endings and trailing whitespace
+                                    let normalized = s.replace("\r\n", "\n").trim_end().to_string();
+                                    sorted_map.insert(k.clone(), serde_json::Value::String(normalized));
+                                } else {
+                                    sorted_map.insert(k.clone(), v.clone());
+                                }
+                            } else {
+                                sorted_map.insert(k.clone(), v.clone());
+                            }
+                        }
+                        serde_json::Value::Object(sorted_map)
+                    } else {
+                        msg.clone()
+                    }
+                }).collect();
+                serde_json::Value::Array(cleaned)
+            }
+            other => other.clone(),
+        }
+    }
+
     /// Computes a deterministic SHA-256 cache key from request parameters
     pub fn compute_key(
         canonical_model: &str,
@@ -116,8 +148,8 @@ impl ResponseCache {
         hasher.update(canonical_model.as_bytes());
         hasher.update(b"|");
         
-        // Serialize messages deterministically
-        if let Ok(serialized) = serde_json::to_vec(messages) {
+        let normalized_messages = Self::normalize_messages(messages);
+        if let Ok(serialized) = serde_json::to_vec(&normalized_messages) {
             hasher.update(&serialized);
         }
         hasher.update(b"|");
