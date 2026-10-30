@@ -53,7 +53,7 @@ pub struct KeyStore {
 
 impl KeyStore {
     pub fn new(file_path: Option<String>) -> Self {
-        let initial_state = if let Some(ref path) = file_path {
+        let mut initial_state = if let Some(ref path) = file_path {
             if let Some(parent) = std::path::Path::new(path).parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -77,6 +77,57 @@ impl KeyStore {
                 keys: Vec::new(),
             }
         };
+
+        // Environment Hydration (Render Ephemeral Recovery)
+        if let Ok(access_env) = std::env::var("ACCESS_JSON") {
+            if let Ok(env_state) = serde_json::from_str::<AccessState>(&access_env) {
+                if initial_state.owner.is_none() && env_state.owner.is_some() {
+                    initial_state.owner = env_state.owner;
+                }
+                for env_key in env_state.keys {
+                    if !initial_state.keys.iter().any(|k| k.hash == env_key.hash) {
+                        initial_state.keys.push(env_key);
+                    }
+                }
+            }
+        }
+
+        // Hydrate from API_KEY or API_KEYS to guarantee env keys persist across container restarts
+        let env_keys_raw = std::env::var("API_KEY")
+            .or_else(|_| std::env::var("API_KEYS"))
+            .unwrap_or_default();
+        if !env_keys_raw.trim().is_empty() {
+            let now_str = chrono::Utc::now().to_rfc3339();
+            for raw_k in env_keys_raw.split(',') {
+                let trimmed = raw_k.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let mut hasher = Sha256::new();
+                hasher.update(trimmed.as_bytes());
+                let hash = hex::encode(hasher.finalize());
+
+                if !initial_state.keys.iter().any(|k| k.hash.eq_ignore_ascii_case(&hash)) {
+                    let prefix = trimmed.chars().take(14).collect();
+                    initial_state.keys.push(KeyRecord {
+                        id: uuid::Uuid::new_v4().simple().to_string(),
+                        name: "Environment Master Key".to_string(),
+                        prefix,
+                        hash,
+                        created_at: now_str.clone(),
+                        last_used_at: None,
+                        expires_at: None,
+                        revoked_at: None,
+                    });
+                }
+            }
+        }
+
+        if let Some(ref path) = file_path {
+            if !initial_state.keys.is_empty() && !std::path::Path::new(path).exists() {
+                let _ = std::fs::write(path, serde_json::to_string_pretty(&initial_state).unwrap_or_default());
+            }
+        }
 
         Self {
             state: RwLock::new(initial_state),
@@ -240,4 +291,22 @@ pub fn verify_api_key(provided_key: &str, configured_keys: &[String]) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_keystore_environment_hydration() {
+        let test_key = "sk-agw-test-env-hydrated-key-1234567890";
+        std::env::set_var("API_KEY", test_key);
+
+        let key_store = KeyStore::new(None);
+        assert!(!key_store.list_keys().is_empty());
+        assert_eq!(key_store.verify_key(test_key), KeyVerification::Valid);
+        assert_eq!(key_store.verify_key("sk-agw-invalid-key"), KeyVerification::NotFound);
+
+        std::env::remove_var("API_KEY");
+    }
 }
