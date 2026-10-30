@@ -85,8 +85,8 @@ async fn main() {
     };
     let key_store = Arc::new(auth::KeyStore::new(Some(access_path_str)));
 
-    // Initialize 40MB In-Memory Cache (W-TinyLFU, 1-hour TTL)
-    let response_cache = Arc::new(cache::ResponseCache::new(40 * 1024 * 1024, 3600));
+    // Initialize In-Memory Cache from environment or production defaults (250MB, 4h TTL)
+    let response_cache = Arc::new(cache::ResponseCache::from_env());
 
     let state = Arc::new(AppState {
         pool: Arc::new(pool),
@@ -103,6 +103,7 @@ async fn main() {
         .route("/console/api/keys", get(console_list_keys).post(console_create_key))
         .route("/console/api/keys/{id}", delete(console_delete_key).patch(console_update_key))
         .route("/console/api/keys/{id}/revoke", post(console_revoke_key))
+        .route("/console/api/cache/clear", post(console_clear_cache))
         .route("/console/api/models", get(console_models))
         .route("/console", get(console::console_handler))
         .route("/console/", get(console::console_handler))
@@ -128,7 +129,13 @@ async fn main() {
 }
 
 async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let (cache_entries, cache_size_bytes, cache_hits, cache_misses) = state.cache.telemetry();
+    let (cache_entries, cache_size_bytes, cache_hits, cache_misses, max_capacity_bytes, ttl_secs) = state.cache.telemetry();
+
+    let utilization_percent = if max_capacity_bytes > 0 {
+        ((cache_size_bytes as f64 / max_capacity_bytes as f64) * 10000.0).round() / 100.0
+    } else {
+        0.0
+    };
 
     Json(serde_json::json!({
         "status": "ok",
@@ -142,6 +149,9 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "cache": {
             "entries": cache_entries,
             "weighted_size_bytes": cache_size_bytes,
+            "max_capacity_bytes": max_capacity_bytes,
+            "utilization_percent": utilization_percent,
+            "ttl_seconds": ttl_secs,
             "hits": cache_hits,
             "misses": cache_misses,
             "hit_ratio": if cache_hits + cache_misses > 0 {
@@ -722,4 +732,12 @@ async fn console_update_key(
     } else {
         (axum::http::StatusCode::NOT_FOUND, "Key not found").into_response()
     }
+}
+
+async fn console_clear_cache(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state.cache.clear().await;
+    Json(serde_json::json!({
+        "success": true,
+        "message": "In-Memory cache purged successfully. All entries cleared."
+    }))
 }

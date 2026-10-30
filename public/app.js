@@ -22,6 +22,24 @@ function example() { return `curl '${session.apiBase}/chat/completions' \
   -H 'Authorization: Bearer YOUR_API_KEY' \
   -H 'Content-Type: application/json' \
   -d '{"model":"MODEL_ID","messages":[{"role":"user","content":"Hello"}]}'`; }
+async function loadCacheStats() {
+  try {
+    const res = await fetch('/health');
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.cache) {
+        const c = data.cache;
+        const usedMb = (c.weighted_size_bytes / (1024 * 1024)).toFixed(2);
+        const maxMb = (c.max_capacity_bytes / (1024 * 1024)).toFixed(0);
+        if ($('cache-ram-stat')) $('cache-ram-stat').textContent = `${usedMb} / ${maxMb} MB (${c.utilization_percent || 0}%)`;
+        if ($('cache-ratio-stat')) $('cache-ratio-stat').textContent = `${c.hit_ratio}%`;
+        if ($('cache-entries-stat')) $('cache-entries-stat').textContent = `${c.entries}`;
+        if ($('cache-ttl-stat')) $('cache-ttl-stat').textContent = `${(c.ttl_seconds / 3600).toFixed(0)} hours`;
+      }
+    }
+  } catch {}
+}
+
 async function render() {
   $('auth-view').hidden = Boolean(session);
   $('dashboard').hidden = !session;
@@ -39,6 +57,7 @@ async function render() {
   $('api-base').value = session.apiBase;
   $('example').textContent = example();
   await loadKeys();
+  await loadCacheStats();
 }
 const date = value => value ? new Date(value).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Never';
 async function loadKeys() {
@@ -215,4 +234,19 @@ async function loadModels() {
 }
 $('models-details').addEventListener('toggle', () => { if ($('models-details').open && !modelsLoaded) loadModels(); });
 $('refresh-models').onclick = loadModels;
+if ($('purge-cache-btn')) {
+  $('purge-cache-btn').onclick = async () => {
+    if (!confirm('Purge in-memory cache? All cached responses will be cleared.')) return;
+    $('purge-cache-btn').disabled = true;
+    try {
+      await api('cache/clear', { method: 'POST' });
+      await loadCacheStats();
+      notify('In-memory cache purged successfully.');
+    } catch (err) {
+      notify(err.message, true);
+    } finally {
+      $('purge-cache-btn').disabled = false;
+    }
+  };
+}
 (async () => { try { const state = await api('session'); configured = state.configured; session = state.authenticated ? state : null; await render(); } catch (error) { notify(error.message, true); } })();

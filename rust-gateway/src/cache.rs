@@ -37,10 +37,13 @@ pub struct ResponseCache {
     cache: Cache<String, CacheEntry>,
     hits: Arc<AtomicU64>,
     misses: Arc<AtomicU64>,
+    max_capacity_bytes: u64,
+    ttl_secs: u64,
+    max_value_bytes: usize,
 }
 
 impl ResponseCache {
-    pub fn new(max_memory_bytes: u64, ttl_secs: u64) -> Self {
+    pub fn new(max_memory_bytes: u64, ttl_secs: u64, max_value_bytes: usize) -> Self {
         let cache = Cache::builder()
             .max_capacity(max_memory_bytes)
             .weigher(|_k: &String, v: &CacheEntry| {
@@ -55,7 +58,51 @@ impl ResponseCache {
             cache,
             hits: Arc::new(AtomicU64::new(0)),
             misses: Arc::new(AtomicU64::new(0)),
+            max_capacity_bytes: max_memory_bytes,
+            ttl_secs,
+            max_value_bytes,
         }
+    }
+
+    /// Creates a ResponseCache configured from environment variables or production defaults
+    /// Defaults: 250MB RAM ceiling, 4 hours TTL (14,400s), 1MB per value
+    pub fn from_env() -> Self {
+        let max_mb = std::env::var("CACHE_MAX_MEMORY_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(250);
+
+        let ttl_secs = std::env::var("CACHE_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(14400);
+
+        let max_value_kb = std::env::var("CACHE_MAX_VALUE_KB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1024);
+
+        let max_memory_bytes = max_mb * 1024 * 1024;
+        let max_value_bytes = max_value_kb * 1024;
+
+        tracing::info!(
+            "Configuring In-Memory W-TinyLFU Cache: {} MB capacity, {}s TTL ({}h), max {} KB per value",
+            max_mb,
+            ttl_secs,
+            ttl_secs / 3600,
+            max_value_kb
+        );
+
+        Self::new(max_memory_bytes, ttl_secs, max_value_bytes)
+    }
+
+    /// Purges all entries from the cache and resets hit/miss counters
+    pub async fn clear(&self) {
+        self.cache.invalidate_all();
+        self.cache.run_pending_tasks().await;
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
+        tracing::info!("In-Memory Cache purged successfully via administrative action");
     }
 
     /// Computes a deterministic SHA-256 cache key from request parameters
@@ -123,10 +170,10 @@ impl ResponseCache {
         }
     }
 
-    /// Insert an entry into the cache (guarded by maximum 1MB per value to prevent bloat)
+    /// Insert an entry into the cache (guarded by configured max_value_bytes to prevent bloat)
     pub async fn insert(&self, key: String, payload: CachedPayload) {
-        if payload.len() > 1024 * 1024 {
-            tracing::warn!("Response body exceeds 1MB cache limit ({}); skipping cache insertion", payload.len());
+        if payload.len() > self.max_value_bytes {
+            tracing::warn!("Response body exceeds {} byte cache limit ({}); skipping cache insertion", self.max_value_bytes, payload.len());
             return;
         }
 
@@ -139,11 +186,11 @@ impl ResponseCache {
     }
 
     /// Expose cache telemetry
-    pub fn telemetry(&self) -> (u64, u64, u64, u64) {
+    pub fn telemetry(&self) -> (u64, u64, u64, u64, u64, u64) {
         let entry_count = self.cache.entry_count();
         let weighted_size = self.cache.weighted_size();
         let hits = self.hits.load(Ordering::Relaxed);
         let misses = self.misses.load(Ordering::Relaxed);
-        (entry_count, weighted_size, hits, misses)
+        (entry_count, weighted_size, hits, misses, self.max_capacity_bytes, self.ttl_secs)
     }
 }
