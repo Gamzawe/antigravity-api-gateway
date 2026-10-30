@@ -8,6 +8,7 @@ mod converter;
 mod storage;
 mod stream;
 mod console;
+mod cache;
 
 use axum::{
     routing::{get, post, delete},
@@ -23,6 +24,7 @@ pub struct AppState {
     pub pool: Arc<storage::AccountPool>,
     pub client: Arc<client::CloudCodeClient>,
     pub key_store: Arc<auth::KeyStore>,
+    pub cache: Arc<cache::ResponseCache>,
 }
 
 #[tokio::main]
@@ -83,10 +85,14 @@ async fn main() {
     };
     let key_store = Arc::new(auth::KeyStore::new(Some(access_path_str)));
 
+    // Initialize 40MB In-Memory Cache (W-TinyLFU, 1-hour TTL)
+    let response_cache = Arc::new(cache::ResponseCache::new(40 * 1024 * 1024, 3600));
+
     let state = Arc::new(AppState {
         pool: Arc::new(pool),
         client: Arc::new(client::CloudCodeClient::new()),
         key_store,
+        cache: response_cache,
     });
 
     let app = Router::new()
@@ -122,6 +128,8 @@ async fn main() {
 }
 
 async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let (cache_entries, cache_size_bytes, cache_hits, cache_misses) = state.cache.telemetry();
+
     Json(serde_json::json!({
         "status": "ok",
         "runtime": "rust",
@@ -130,7 +138,18 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "queue_waiting": state.pool.get_queue_waiting(),
         "max_concurrency": state.pool.get_max_total(),
         "max_queue_depth": state.pool.get_max_queue_depth(),
-        "arch": "tokio-axum-native"
+        "arch": "tokio-axum-native",
+        "cache": {
+            "entries": cache_entries,
+            "weighted_size_bytes": cache_size_bytes,
+            "hits": cache_hits,
+            "misses": cache_misses,
+            "hit_ratio": if cache_hits + cache_misses > 0 {
+                (cache_hits as f64 / (cache_hits + cache_misses) as f64 * 100.0).round()
+            } else {
+                0.0
+            }
+        }
     }))
 }
 
@@ -324,6 +343,58 @@ async fn chat_completions(
     let canonical = resolution.canonical_model;
     let thinking_budget = resolution.thinking_budget;
 
+    // --- In-Memory Intelligent Cache Lookup ---
+    let cache_control_hdr = headers.get("x-cache-control")
+        .or_else(|| headers.get(axum::http::header::CACHE_CONTROL))
+        .and_then(|h| h.to_str().ok());
+
+    let is_cacheable = cache::ResponseCache::is_cacheable(
+        payload.temperature,
+        cache_control_hdr,
+        payload.stream,
+    );
+
+    let messages_val = serde_json::to_value(&payload.messages).unwrap_or(serde_json::Value::Null);
+    let cache_key = if is_cacheable {
+        Some(cache::ResponseCache::compute_key(
+            canonical,
+            &messages_val,
+            payload.tools.as_ref(),
+            thinking_budget,
+        ))
+    } else {
+        None
+    };
+
+    if let Some(ref key) = cache_key {
+        if let Some(entry) = state.cache.get(key).await {
+            tracing::info!("Cache HIT for key: {} (model: {}, stream: {})", key, canonical, payload.stream);
+            match entry.payload {
+                cache::CachedPayload::Json(bytes) => {
+                    let resp = axum::response::Response::builder()
+                        .status(axum::http::StatusCode::OK)
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .header("x-cache", "HIT")
+                        .header("x-cache-key", key)
+                        .body(axum::body::Body::from(bytes))
+                        .unwrap();
+                    return Ok(resp);
+                }
+                cache::CachedPayload::Sse(bytes) => {
+                    let resp = axum::response::Response::builder()
+                        .status(axum::http::StatusCode::OK)
+                        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+                        .header("x-cache", "HIT")
+                        .header("x-cache-key", key)
+                        .body(axum::body::Body::from(bytes))
+                        .unwrap();
+                    return Ok(resp);
+                }
+            }
+        }
+    }
+
     // Multi-account retry loop (up to 3 attempts with automatic 429 failover)
     let max_retries = 3;
     let mut last_err = String::new();
@@ -378,12 +449,20 @@ async fn chat_completions(
             Ok(resp) => {
                 if payload.stream {
                     let stream_ctx = Arc::new(stream::StreamContext::new(canonical.to_string()));
-                    let sse_stream = stream::create_openai_sse_stream(resp, stream_ctx);
-                    return Ok(axum::response::sse::Sse::new(sse_stream).keep_alive(axum::response::sse::KeepAlive::default()).into_response());
+                    let cache_opt = cache_key.map(|k| (state.cache.clone(), k));
+                    let is_miss = cache_opt.is_some();
+                    let sse_stream = stream::create_openai_sse_stream(resp, stream_ctx, cache_opt);
+
+                    let mut sse_resp = axum::response::sse::Sse::new(sse_stream)
+                        .keep_alive(axum::response::sse::KeepAlive::default())
+                        .into_response();
+                    sse_resp.headers_mut().insert("x-cache", (if is_miss { "MISS" } else { "BYPASS" }).parse().unwrap());
+                    return Ok(sse_resp);
                 } else {
                     let raw_text = resp.text().await.unwrap_or_default();
                     let clean_text = extract_clean_text_from_sse(&raw_text);
-                    return Ok(Json(serde_json::json!({
+
+                    let json_body = serde_json::json!({
                         "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
                         "object": "chat.completion",
                         "created": chrono::Utc::now().timestamp(),
@@ -396,7 +475,24 @@ async fn chat_completions(
                             },
                             "finish_reason": "stop"
                         }]
-                    })).into_response());
+                    });
+
+                    let body_bytes = serde_json::to_vec(&json_body).unwrap_or_default();
+
+                    // Insert into in-memory cache if eligible
+                    let is_miss = cache_key.is_some();
+                    if let Some(key) = cache_key {
+                        state.cache.insert(key, cache::CachedPayload::Json(bytes::Bytes::from(body_bytes.clone()))).await;
+                    }
+
+                    let resp = axum::response::Response::builder()
+                        .status(axum::http::StatusCode::OK)
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .header("x-cache", if is_miss { "MISS" } else { "BYPASS" })
+                        .body(axum::body::Body::from(body_bytes))
+                        .unwrap();
+
+                    return Ok(resp);
                 }
             }
             Err(e) => {

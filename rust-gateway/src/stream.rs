@@ -24,11 +24,11 @@ impl StreamContext {
     }
 }
 
-/// Parses Google CloudCode SSE chunk and converts to OpenAI-compatible SSE Event
+/// Parses Google CloudCode SSE chunk and converts to OpenAI-compatible SSE Event and wire representation
 pub fn process_google_sse_chunk(
     ctx: &StreamContext,
     raw_json: &str,
-) -> Vec<Result<Event, axum::Error>> {
+) -> Vec<(Event, String)> {
     let mut events = Vec::new();
 
     let Ok(val) = serde_json::from_str::<Value>(raw_json) else {
@@ -61,7 +61,8 @@ pub fn process_google_sse_chunk(
                             "finish_reason": null
                         }]
                     });
-                    events.push(Ok(Event::default().data(payload.to_string())));
+                    let data_str = payload.to_string();
+                    events.push((Event::default().data(data_str.clone()), format!("data: {}\n\n", data_str)));
                 }
             }
 
@@ -91,7 +92,8 @@ pub fn process_google_sse_chunk(
                         "finish_reason": "tool_calls"
                     }]
                 });
-                events.push(Ok(Event::default().data(payload.to_string())));
+                let data_str = payload.to_string();
+                events.push((Event::default().data(data_str.clone()), format!("data: {}\n\n", data_str)));
             }
         }
     }
@@ -99,13 +101,15 @@ pub fn process_google_sse_chunk(
     events
 }
 
-/// Creates a streaming response from an upstream reqwest response
+/// Creates a streaming response from an upstream reqwest response, optionally buffering wire bytes for caching
 pub fn create_openai_sse_stream(
     response: reqwest::Response,
     ctx: Arc<StreamContext>,
+    cache_opt: Option<(Arc<crate::cache::ResponseCache>, String)>,
 ) -> impl Stream<Item = Result<Event, axum::Error>> {
     async_stream::stream! {
         let mut event_stream = response.bytes_stream().eventsource();
+        let mut tap_buffer = Vec::new();
 
         while let Some(item) = event_stream.next().await {
             match item {
@@ -114,8 +118,11 @@ pub fn create_openai_sse_stream(
                         break;
                     }
                     let evs = process_google_sse_chunk(&ctx, &event.data);
-                    for ev in evs {
-                        yield ev;
+                    for (ev, wire) in evs {
+                        if cache_opt.is_some() {
+                            tap_buffer.extend_from_slice(wire.as_bytes());
+                        }
+                        yield Ok(ev);
                     }
                 }
                 Err(err) => {
@@ -123,6 +130,11 @@ pub fn create_openai_sse_stream(
                     break;
                 }
             }
+        }
+
+        if let Some((cache, key)) = cache_opt {
+            tap_buffer.extend_from_slice(b"data: [DONE]\n\n");
+            cache.insert(key, crate::cache::CachedPayload::Sse(bytes::Bytes::from(tap_buffer))).await;
         }
 
         yield Ok(Event::default().data("[DONE]"));
