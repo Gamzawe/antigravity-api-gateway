@@ -7,6 +7,23 @@ pub fn convert_messages_to_google(messages: &[ChatMessage]) -> (Option<Value>, V
     let mut system_instruction: Option<Value> = None;
     let mut contents: Vec<Value> = Vec::new();
 
+    // Map tool_call_id to function name for OpenAI -> Gemini tool response correlation
+    let mut tool_id_to_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for msg in messages {
+        if let Some(tool_calls) = &msg.tool_calls {
+            if let Some(calls) = tool_calls.as_array() {
+                for call in calls {
+                    if let (Some(id), Some(name)) = (
+                        call.get("id").and_then(|i| i.as_str()),
+                        call.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()),
+                    ) {
+                        tool_id_to_name.insert(id.to_string(), name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     for msg in messages {
         let role = msg.role.as_str();
 
@@ -29,23 +46,25 @@ pub fn convert_messages_to_google(messages: &[ChatMessage]) -> (Option<Value>, V
 
         let mut parts = Vec::new();
 
-        // Handle text content
-        match &msg.content {
-            Value::String(s) => {
-                if !s.trim().is_empty() {
-                    parts.push(json!({ "text": s }));
+        // Handle text content (only for user/assistant messages, not tool responses)
+        if role != "tool" {
+            match &msg.content {
+                Value::String(s) => {
+                    if !s.trim().is_empty() {
+                        parts.push(json!({ "text": s }));
+                    }
                 }
-            }
-            Value::Array(arr) => {
-                for item in arr {
-                    if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
-                        if !t.trim().is_empty() {
-                            parts.push(json!({ "text": t }));
+                Value::Array(arr) => {
+                    for item in arr {
+                        if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                            if !t.trim().is_empty() {
+                                parts.push(json!({ "text": t }));
+                            }
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
 
         // Handle tool calls from assistant
@@ -57,14 +76,19 @@ pub fn convert_messages_to_google(messages: &[ChatMessage]) -> (Option<Value>, V
                         call.get("function").and_then(|f| f.get("arguments")),
                     ) {
                         let parsed_args = match args_val {
-                            Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or(json!({})),
-                            v => v.clone(),
+                            Value::String(s) => match serde_json::from_str::<Value>(s) {
+                                Ok(Value::Object(m)) => Value::Object(m),
+                                _ => json!({}),
+                            },
+                            Value::Object(m) => Value::Object(m.clone()),
+                            _ => json!({}),
                         };
                         parts.push(json!({
                             "functionCall": {
                                 "name": name,
                                 "args": parsed_args
-                            }
+                            },
+                            "thoughtSignature": "skip_thought_signature_validator"
                         }));
                     }
                 }
@@ -73,10 +97,16 @@ pub fn convert_messages_to_google(messages: &[ChatMessage]) -> (Option<Value>, V
 
         // Handle tool responses from client
         if role == "tool" {
-            let name = msg.name.clone().unwrap_or_else(|| "tool_result".into());
+            let name = msg.name.clone()
+                .or_else(|| msg.tool_call_id.as_ref().and_then(|id| tool_id_to_name.get(id).cloned()))
+                .unwrap_or_else(|| "tool_result".into());
             let content_val = match &msg.content {
-                Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({ "output": s })),
-                v => v.clone(),
+                Value::String(s) => match serde_json::from_str::<Value>(s) {
+                    Ok(Value::Object(map)) => Value::Object(map),
+                    _ => json!({ "output": s }),
+                },
+                Value::Object(map) => Value::Object(map.clone()),
+                other => json!({ "output": other }),
             };
             parts.push(json!({
                 "functionResponse": {
@@ -282,5 +312,47 @@ data: {"response": {"candidates": [{"content": {"role": "model","parts": [{"thou
         assert_eq!(extracted.content.as_deref(), Some("Hello world!"));
         assert_eq!(extracted.reasoning_content.as_deref(), Some("Thinking deeply..."));
         assert!(extracted.tool_calls.is_none());
+    }
+
+    #[test]
+    fn test_convert_messages_tool_response_struct_and_thought_signature() {
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: serde_json::Value::Null,
+                name: None,
+                tool_calls: Some(json!([{
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {
+                        "name": "run_shell",
+                        "arguments": "{\"cmd\":\"echo 10\"}"
+                    }
+                }])),
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: json!("10"),
+                name: None,
+                tool_calls: None,
+                tool_call_id: Some("call_123".into()),
+            },
+        ];
+
+        let (_, contents) = convert_messages_to_google(&messages);
+        assert_eq!(contents.len(), 2);
+
+        // Model call part must contain thoughtSignature
+        let model_parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(model_parts[0]["thoughtSignature"], "skip_thought_signature_validator");
+        assert_eq!(model_parts[0]["functionCall"]["name"], "run_shell");
+
+        // Tool response part must be correlated to "run_shell" and response must be a JSON Object Struct
+        let tool_parts = contents[1]["parts"].as_array().unwrap();
+        let fn_resp = &tool_parts[0]["functionResponse"];
+        assert_eq!(fn_resp["name"], "run_shell");
+        assert!(fn_resp["response"].is_object(), "functionResponse.response MUST be a JSON Object (Google Struct)");
+        assert_eq!(fn_resp["response"]["output"], "10");
     }
 }
