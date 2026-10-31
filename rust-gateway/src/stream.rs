@@ -13,6 +13,7 @@ pub struct StreamContext {
     pub model: String,
     pub downstream_committed: Arc<AtomicBool>,
     pub tool_counter: Arc<std::sync::atomic::AtomicUsize>,
+    pub finish_sent: Arc<AtomicBool>,
 }
 
 impl StreamContext {
@@ -22,8 +23,31 @@ impl StreamContext {
             model,
             downstream_committed: Arc::new(AtomicBool::new(false)),
             tool_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            finish_sent: Arc::new(AtomicBool::new(false)),
         }
     }
+}
+
+/// Emits a terminal chunk with a non-null finish_reason if the upstream stream
+/// never provided one. OpenAI-compatible clients rely on this to know the
+/// completion is done; without it some clients keep issuing continuation turns.
+pub fn final_finish_chunk(ctx: &StreamContext) -> Option<(Event, String)> {
+    if ctx.finish_sent.swap(true, Ordering::SeqCst) {
+        return None;
+    }
+    let payload = json!({
+        "id": ctx.stream_id,
+        "object": "chat.completion.chunk",
+        "created": chrono::Utc::now().timestamp(),
+        "model": ctx.model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop"
+        }]
+    });
+    let data_str = payload.to_string();
+    Some((Event::default().data(data_str.clone()), format!("data: {}\n\n", data_str)))
 }
 
 /// Parses Google CloudCode SSE chunk and converts to OpenAI-compatible SSE Event and wire representation
@@ -77,6 +101,7 @@ pub fn process_google_sse_chunk(
                     // Function call handling
                     if let Some(fc) = part.get("functionCall") {
                         ctx.downstream_committed.store(true, Ordering::SeqCst);
+                        ctx.finish_sent.store(true, Ordering::SeqCst);
                         let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
                         let args = fc.get("args").cloned().unwrap_or(json!({}));
                         let tool_idx = ctx.tool_counter.fetch_add(1, Ordering::SeqCst);
@@ -143,6 +168,13 @@ pub fn create_openai_sse_stream(
             }
         }
 
+        if let Some((ev, wire)) = final_finish_chunk(&ctx) {
+            if cache_opt.is_some() {
+                tap_buffer.extend_from_slice(wire.as_bytes());
+            }
+            yield Ok(ev);
+        }
+
         if let Some((cache, key)) = cache_opt {
             tap_buffer.extend_from_slice(b"data: [DONE]\n\n");
             cache.insert(key, crate::cache::CachedPayload::Sse(bytes::Bytes::from(tap_buffer))).await;
@@ -175,5 +207,27 @@ mod tests {
         assert_eq!(ev1_val["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "search_files");
         assert_eq!(ev1_val["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
         assert_eq!(ev1_val["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn test_final_finish_chunk_after_text() {
+        let ctx = StreamContext::new("m".to_string());
+        let text_chunk = r#"{"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}"#;
+        process_google_sse_chunk(&ctx, text_chunk);
+
+        let (_, wire) = final_finish_chunk(&ctx).expect("text stream needs terminal chunk");
+        let val: Value = serde_json::from_str(wire.trim_start_matches("data:").trim()).unwrap();
+        assert_eq!(val["choices"][0]["delta"], json!({}));
+        assert_eq!(val["choices"][0]["finish_reason"], "stop");
+        assert!(final_finish_chunk(&ctx).is_none(), "terminal chunk must be emitted once");
+    }
+
+    #[test]
+    fn test_final_finish_chunk_skipped_after_tool_call() {
+        let ctx = StreamContext::new("m".to_string());
+        let tool_chunk = r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"run","args":{}}}]}}]}"#;
+        process_google_sse_chunk(&ctx, tool_chunk);
+
+        assert!(final_finish_chunk(&ctx).is_none(), "tool chunk already carried finish_reason");
     }
 }

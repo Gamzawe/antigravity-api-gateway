@@ -366,6 +366,21 @@ pub fn convert_messages_to_google(messages: &[ChatMessage]) -> (Option<Value>, V
         }
     }
 
+    if let Some(last) = contents.last() {
+        let is_model = last.get("role").and_then(|r| r.as_str()) == Some("model");
+        let has_function_call = last
+            .get("parts")
+            .and_then(|p| p.as_array())
+            .map(|parts| parts.iter().any(|part| part.get("functionCall").is_some()))
+            .unwrap_or(false);
+        if is_model && !has_function_call {
+            contents.push(json!({
+                "role": "user",
+                "parts": [{ "text": "Continue." }]
+            }));
+        }
+    }
+
     (system_instruction, contents)
 }
 
@@ -606,6 +621,51 @@ data: {"response": {"candidates": [{"content": {"role": "model","parts": [{"thou
         assert_eq!(fn_resp["name"], "run_shell");
         assert!(fn_resp["response"].is_object(), "functionResponse.response MUST be a JSON Object (Google Struct)");
         assert_eq!(fn_resp["response"]["output"], "10");
+    }
+
+    #[test]
+    fn test_convert_messages_appends_user_turn_after_trailing_model_text() {
+        let messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: json!("hi"),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: json!("hello"),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+
+        let (_, contents) = convert_messages_to_google(&messages);
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(contents[2]["parts"][0]["text"], "Continue.");
+    }
+
+    #[test]
+    fn test_convert_messages_does_not_append_after_trailing_tool_call() {
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: serde_json::Value::Null,
+            name: None,
+            tool_calls: Some(json!([{
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "run_shell", "arguments": "{}" }
+            }])),
+            tool_call_id: None,
+        }];
+
+        let (_, contents) = convert_messages_to_google(&messages);
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "model");
     }
 
     #[test]
