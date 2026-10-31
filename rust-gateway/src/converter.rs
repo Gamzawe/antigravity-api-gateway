@@ -1,7 +1,249 @@
 //! Full Google CloudCode Payload Builder & Message Converter
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use crate::types::ChatMessage;
+
+fn is_unsupported_schema_key(key: &str) -> bool {
+    matches!(
+        key,
+        "additionalProperties"
+            | "default"
+            | "$schema"
+            | "$defs"
+            | "definitions"
+            | "$ref"
+            | "$id"
+            | "$comment"
+            | "title"
+            | "minLength"
+            | "maxLength"
+            | "pattern"
+            | "format"
+            | "minItems"
+            | "maxItems"
+            | "examples"
+            | "allOf"
+            | "anyOf"
+            | "oneOf"
+            | "strict"
+    )
+}
+
+fn score_schema_option(value: &Value) -> i32 {
+    if let Some(obj) = value.as_object() {
+        if obj.get("type").and_then(|t| t.as_str()) == Some("object") || obj.contains_key("properties") {
+            return 3;
+        }
+        if obj.get("type").and_then(|t| t.as_str()) == Some("array") || obj.contains_key("items") {
+            return 2;
+        }
+        if let Some(t) = obj.get("type").and_then(|t| t.as_str()) {
+            if t != "null" {
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+fn append_description_hint(obj: &mut Map<String, Value>, hint: &str) {
+    let merged = match obj.get("description").and_then(|d| d.as_str()) {
+        Some(existing) if !existing.is_empty() => format!("{} ({})", existing, hint),
+        _ => hint.to_string(),
+    };
+    obj.insert("description".into(), Value::String(merged));
+}
+
+/// Strip JSON Schema constructs that Google's function declaration API rejects,
+/// while preserving as much type information as possible.
+pub fn sanitize_schema_for_gemini(schema: &Value) -> Value {
+    match schema {
+        Value::Array(items) => {
+            Value::Array(items.iter().map(sanitize_schema_for_gemini).collect())
+        }
+        Value::Object(obj) => {
+            if let Some(reference) = obj.get("$ref").and_then(|v| v.as_str()) {
+                let name = reference.rsplit('/').next().unwrap_or("unknown");
+                return json!({ "type": "object", "description": format!("See: {}", name) });
+            }
+
+            let mut out: Map<String, Value> = obj.clone();
+
+            if let Some(all_of) = out.remove("allOf") {
+                if let Some(subschemas) = all_of.as_array() {
+                    let mut merged_properties: Map<String, Value> = Map::new();
+                    let mut merged_required: Vec<Value> = Vec::new();
+                    let mut other: Map<String, Value> = Map::new();
+                    for sub in subschemas {
+                        if let Some(sub_obj) = sub.as_object() {
+                            if let Some(props) = sub_obj.get("properties").and_then(|v| v.as_object()) {
+                                for (k, v) in props {
+                                    merged_properties.insert(k.clone(), v.clone());
+                                }
+                            }
+                            if let Some(required) = sub_obj.get("required").and_then(|v| v.as_array()) {
+                                for r in required {
+                                    if !merged_required.contains(r) {
+                                        merged_required.push(r.clone());
+                                    }
+                                }
+                            }
+                            for (k, v) in sub_obj {
+                                if k != "properties" && k != "required" && !other.contains_key(k) {
+                                    other.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                    }
+                    for (k, v) in other {
+                        if !out.contains_key(&k) {
+                            out.insert(k, v);
+                        }
+                    }
+                    if !merged_properties.is_empty() {
+                        if let Some(props) = out.get("properties").and_then(|v| v.as_object()) {
+                            for (k, v) in props {
+                                merged_properties.insert(k.clone(), v.clone());
+                            }
+                        }
+                        out.insert("properties".into(), Value::Object(merged_properties));
+                    }
+                    if !merged_required.is_empty() {
+                        if let Some(required) = out.get("required").and_then(|v| v.as_array()) {
+                            for r in required {
+                                if !merged_required.contains(r) {
+                                    merged_required.push(r.clone());
+                                }
+                            }
+                        }
+                        out.insert("required".into(), Value::Array(merged_required));
+                    }
+                }
+            }
+
+            for union_key in ["anyOf", "oneOf"] {
+                if let Some(union) = out.remove(union_key) {
+                    if let Some(options) = union.as_array() {
+                        let mut best: Option<&Value> = None;
+                        let mut best_score = -1;
+                        let mut type_names: Vec<String> = Vec::new();
+                        for option in options {
+                            if let Some(option_obj) = option.as_object() {
+                                if let Some(t) = option_obj.get("type").and_then(|v| v.as_str()) {
+                                    if t != "null" {
+                                        type_names.push(t.to_string());
+                                    }
+                                } else if option_obj.contains_key("properties") {
+                                    type_names.push("object".into());
+                                }
+                                let score = score_schema_option(option);
+                                if score > best_score {
+                                    best_score = score;
+                                    best = Some(option);
+                                }
+                            }
+                        }
+                        if let Some(selected) = best {
+                            let flattened = sanitize_schema_for_gemini(selected);
+                            if let Some(flattened_obj) = flattened.as_object() {
+                                let parent_description = out.get("description").cloned();
+                                for (k, v) in flattened_obj {
+                                    if k == "description" {
+                                        if parent_description.as_ref() != Some(v) {
+                                            match parent_description.as_ref().and_then(|d| d.as_str()) {
+                                                Some(parent) => {
+                                                    let merged = format!("{} ({})", parent, v.as_str().unwrap_or(""));
+                                                    out.insert("description".into(), Value::String(merged));
+                                                }
+                                                None => {
+                                                    out.insert("description".into(), v.clone());
+                                                }
+                                            }
+                                        }
+                                    } else if !out.contains_key(k) || k == "type" || k == "properties" || k == "items" {
+                                        out.insert(k.clone(), v.clone());
+                                    }
+                                }
+                                if type_names.len() > 1 {
+                                    let mut unique: Vec<String> = Vec::new();
+                                    for t in type_names {
+                                        if !unique.contains(&t) {
+                                            unique.push(t);
+                                        }
+                                    }
+                                    append_description_hint(&mut out, &format!("Accepts: {}", unique.join(" | ")));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(type_value) = out.get("type").cloned() {
+                if let Some(type_array) = type_value.as_array() {
+                    let mut chosen: Option<String> = None;
+                    let mut nullable = false;
+                    for t in type_array {
+                        if let Some(name) = t.as_str() {
+                            if name == "null" {
+                                nullable = true;
+                            } else if chosen.is_none() {
+                                chosen = Some(name.to_string());
+                            }
+                        }
+                    }
+                    match chosen {
+                        Some(name) => {
+                            out.insert("type".into(), Value::String(name));
+                        }
+                        None => {
+                            out.remove("type");
+                        }
+                    }
+                    if nullable {
+                        out.insert("nullable".into(), Value::Bool(true));
+                    }
+                }
+            }
+
+            let keys: Vec<String> = out.keys().cloned().collect();
+            for key in keys {
+                if is_unsupported_schema_key(&key) {
+                    out.remove(&key);
+                }
+            }
+
+            if let Some(props) = out.get("properties").and_then(|v| v.as_object()).cloned() {
+                let mut cleaned = Map::new();
+                for (k, v) in props {
+                    cleaned.insert(k, sanitize_schema_for_gemini(&v));
+                }
+                out.insert("properties".into(), Value::Object(cleaned));
+            }
+
+            if let Some(items) = out.get("items").cloned() {
+                out.insert("items".into(), sanitize_schema_for_gemini(&items));
+            }
+
+            if let Some(required) = out.get("required").and_then(|v| v.as_array()).cloned() {
+                if let Some(props) = out.get("properties").and_then(|v| v.as_object()) {
+                    let filtered: Vec<Value> = required
+                        .into_iter()
+                        .filter(|r| r.as_str().map(|s| props.contains_key(s)).unwrap_or(false))
+                        .collect();
+                    if filtered.is_empty() {
+                        out.remove("required");
+                    } else {
+                        out.insert("required".into(), Value::Array(filtered));
+                    }
+                }
+            }
+
+            Value::Object(out)
+        }
+        _ => schema.clone(),
+    }
+}
 
 pub fn convert_messages_to_google(messages: &[ChatMessage]) -> (Option<Value>, Vec<Value>) {
     let mut system_instruction: Option<Value> = None;
@@ -158,8 +400,18 @@ pub fn build_cloudcode_payload(
         if let Some(tools_arr) = tool_defs.as_array() {
             let mut declarations = Vec::new();
             for t in tools_arr {
-                if let Some(func) = t.get("function") {
-                    declarations.push(func.clone());
+                if let Some(func) = t.get("function").and_then(|f| f.as_object()) {
+                    let mut declaration = Map::new();
+                    if let Some(name) = func.get("name") {
+                        declaration.insert("name".into(), name.clone());
+                    }
+                    if let Some(description) = func.get("description") {
+                        declaration.insert("description".into(), description.clone());
+                    }
+                    if let Some(parameters) = func.get("parameters") {
+                        declaration.insert("parameters".into(), sanitize_schema_for_gemini(parameters));
+                    }
+                    declarations.push(Value::Object(declaration));
                 }
             }
             if !declarations.is_empty() {
@@ -354,5 +606,60 @@ data: {"response": {"candidates": [{"content": {"role": "model","parts": [{"thou
         assert_eq!(fn_resp["name"], "run_shell");
         assert!(fn_resp["response"].is_object(), "functionResponse.response MUST be a JSON Object (Google Struct)");
         assert_eq!(fn_resp["response"]["output"], "10");
+    }
+
+    #[test]
+    fn test_sanitize_schema_removes_unsupported_and_flattens() {
+        let schema = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "cmd": { "type": "string", "format": "uri", "default": "ls" },
+                "count": { "anyOf": [{ "type": "null" }, { "type": "integer" }] }
+            },
+            "required": ["cmd", "missing"]
+        });
+
+        let cleaned = sanitize_schema_for_gemini(&schema);
+        assert!(cleaned.get("$schema").is_none());
+        assert!(cleaned.get("additionalProperties").is_none());
+
+        let props = cleaned["properties"].as_object().unwrap();
+        assert!(props["cmd"].get("format").is_none());
+        assert!(props["cmd"].get("default").is_none());
+        assert_eq!(props["count"]["type"], "integer");
+
+        let required = cleaned["required"].as_array().unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0], "cmd");
+    }
+
+    #[test]
+    fn test_build_payload_sanitizes_tool_parameters() {
+        let messages: Vec<ChatMessage> = Vec::new();
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "run_shell",
+                "description": "run a command",
+                "strict": true,
+                "parameters": {
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": { "cmd": { "type": "string" } },
+                    "required": ["cmd"]
+                }
+            }
+        }]);
+
+        let payload = build_cloudcode_payload("project", "gemini-3.8-flash", &messages, Some(&tools), None);
+        let declaration = &payload["request"]["tools"][0]["functionDeclarations"][0];
+        assert_eq!(declaration["name"], "run_shell");
+        assert!(declaration.get("strict").is_none());
+        assert!(declaration["parameters"].get("$schema").is_none());
+        assert!(declaration["parameters"].get("additionalProperties").is_none());
+        assert_eq!(declaration["parameters"]["properties"]["cmd"]["type"], "string");
     }
 }
