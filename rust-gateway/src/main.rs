@@ -11,11 +11,13 @@ mod console;
 mod cache;
 
 use axum::{
-    routing::{get, post, delete},
+    routing::{get, post, delete, patch},
     Router, Json,
-    response::IntoResponse,
-    extract::State,
+    response::{IntoResponse, Response},
+    extract::{State, Path},
+    http::StatusCode,
 };
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -74,7 +76,7 @@ async fn main() {
             })
     };
 
-    tracing::info!("Loaded {} active Google accounts into Rust Lease Engine", pool.get_account_count());
+    tracing::info!("Loaded {} active Google accounts into Rust Lease Engine", pool.get_account_count().await);
 
     // Initialize KeyStore (ensure path is always set to data/console/access.json)
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string());
@@ -100,9 +102,15 @@ async fn main() {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/console/api/session", get(console_session))
+        .route("/console/api/auth/setup", post(console_auth_setup))
+        .route("/console/api/auth/login", post(console_auth_login))
+        .route("/console/api/auth/logout", post(console_auth_logout))
         .route("/console/api/keys", get(console_list_keys).post(console_create_key))
         .route("/console/api/keys/{id}", delete(console_delete_key).patch(console_update_key))
         .route("/console/api/keys/{id}/revoke", post(console_revoke_key))
+        .route("/console/api/accounts", get(console_list_accounts).post(console_add_account))
+        .route("/console/api/accounts/{email}", delete(console_delete_account))
+        .route("/console/api/accounts/export", get(console_export_accounts))
         .route("/console/api/cache/clear", post(console_clear_cache))
         .route("/console/api/models", get(console_models))
         .route("/console", get(console::console_handler))
@@ -130,6 +138,7 @@ async fn main() {
 
 async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let (cache_entries, cache_size_bytes, cache_hits, cache_misses, max_capacity_bytes, ttl_secs) = state.cache.telemetry();
+    let account_count = state.pool.get_account_count().await;
 
     let utilization_percent = if max_capacity_bytes > 0 {
         ((cache_size_bytes as f64 / max_capacity_bytes as f64) * 10000.0).round() / 100.0
@@ -140,7 +149,7 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
         "runtime": "rust",
-        "accounts_configured": state.pool.get_account_count(),
+        "accounts_configured": account_count,
         "active_in_flight": state.pool.get_total_in_flight(),
         "queue_waiting": state.pool.get_queue_waiting(),
         "max_concurrency": state.pool.get_max_total(),
@@ -500,6 +509,16 @@ async fn chat_completions(
                     state.pool.mark_rate_limited(&account, 15).await;
                     last_err = "Upstream Google 429: Account temporarily backed off".into();
                     continue;
+                } else if e == "UPSTREAM_TTFB_TIMEOUT" {
+                    tracing::warn!(
+                        "Account {} stalled on TTFB (>11s). Marking 30s cooldown and failing over (attempt {}/{})",
+                        account.email,
+                        attempt + 1,
+                        max_retries
+                    );
+                    state.pool.mark_rate_limited(&account, 30).await;
+                    last_err = format!("Account {} TTFB timed out after 11s", account.email);
+                    continue;
                 }
                 last_err = e;
             }
@@ -541,17 +560,109 @@ struct KeyActionQuery {
     action: Option<String>,
 }
 
-async fn console_session(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let configured = true;
-    let username = state.key_store.get_owner_username().unwrap_or_else(|| "Arafat".into());
+#[derive(serde::Deserialize)]
+struct AuthPayload {
+    username: String,
+    password: String,
+}
+
+fn extract_session_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
+    if let Some(cookie_header) = headers.get(axum::http::header::COOKIE) {
+        if let Ok(cookie_str) = cookie_header.to_str() {
+            for part in cookie_str.split(';') {
+                let mut kv = part.trim().splitn(2, '=');
+                if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
+                    if k == "antigravity_session" {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn console_session(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let configured = state.key_store.is_configured();
+    let maybe_token = extract_session_cookie(&headers);
+
+    let authenticated = if configured {
+        if let Some(token) = maybe_token {
+            // Check session token validity
+            token == "auth-owner-session-valid"
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let username = state.key_store.get_owner_username().unwrap_or_else(|| "Owner".into());
 
     Json(serde_json::json!({
         "configured": configured,
-        "authenticated": true,
+        "authenticated": authenticated,
         "username": username,
         "csrf": "rust-csrf-token",
         "apiBase": "/v1"
     }))
+}
+
+async fn console_auth_setup(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<AuthPayload>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    match state.key_store.setup_owner(&payload.username, &payload.password) {
+        Ok(user) => {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::SET_COOKIE,
+                "antigravity_session=auth-owner-session-valid; Path=/console; HttpOnly; SameSite=Lax; Max-Age=604800"
+                    .parse()
+                    .unwrap(),
+            );
+            Ok((headers, Json(serde_json::json!({ "success": true, "username": user }))))
+        }
+        Err(err) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": { "message": err } })),
+        )),
+    }
+}
+
+async fn console_auth_login(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<AuthPayload>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    if state.key_store.verify_login(&payload.username, &payload.password) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::SET_COOKIE,
+            "antigravity_session=auth-owner-session-valid; Path=/console; HttpOnly; SameSite=Lax; Max-Age=604800"
+                .parse()
+                .unwrap(),
+        );
+        Ok((headers, Json(serde_json::json!({ "success": true, "username": payload.username.trim() }))))
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": { "message": "Invalid username or password" } })),
+        ))
+    }
+}
+
+async fn console_auth_logout() -> impl IntoResponse {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::SET_COOKIE,
+        "antigravity_session=; Path=/console; HttpOnly; SameSite=Lax; Max-Age=0"
+            .parse()
+            .unwrap(),
+    );
+    (headers, Json(serde_json::json!({ "success": true })))
 }
 
 async fn list_models() -> impl IntoResponse {
@@ -722,6 +833,61 @@ async fn console_update_key(
     } else {
         (axum::http::StatusCode::NOT_FOUND, "Key not found").into_response()
     }
+}
+
+#[derive(Deserialize)]
+struct AddAccountReq {
+    email: String,
+    #[serde(rename = "refreshToken")]
+    refresh_token: String,
+    #[serde(rename = "projectId")]
+    project_id: Option<String>,
+}
+
+async fn console_list_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let accounts = state.pool.list_accounts_telemetry().await;
+    let total_accounts = accounts.len();
+    Json(serde_json::json!({
+        "accounts": accounts,
+        "total_accounts": total_accounts,
+        "max_capacity": state.pool.get_max_total()
+    }))
+}
+
+async fn console_add_account(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<AddAccountReq>,
+) -> impl IntoResponse {
+    let entry = storage::AccountFileEntry {
+        email: payload.email,
+        refresh_token: Some(payload.refresh_token),
+        project_id: payload.project_id,
+        enabled: true,
+    };
+
+    match state.pool.add_or_update_account(entry).await {
+        Ok(()) => Json(serde_json::json!({ "success": true, "message": "Account added or updated successfully" })).into_response(),
+        Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response(),
+    }
+}
+
+async fn console_delete_account(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(email): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.pool.remove_account(&email).await {
+        Ok(true) => Json(serde_json::json!({ "deleted": true, "email": email })).into_response(),
+        Ok(false) => (axum::http::StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Account not found" }))).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
+    }
+}
+
+async fn console_export_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let config = state.pool.export_accounts_json().await;
+    Json(serde_json::json!({
+        "accounts": config.accounts,
+        "raw_json": serde_json::to_string(&config).unwrap_or_default()
+    }))
 }
 
 async fn console_clear_cache(State(state): State<Arc<AppState>>) -> impl IntoResponse {

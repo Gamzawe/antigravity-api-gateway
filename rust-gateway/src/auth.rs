@@ -143,6 +143,57 @@ impl KeyStore {
         self.state.read().unwrap().owner.as_ref().map(|o| o.username.clone())
     }
 
+    pub fn setup_owner(&self, username: &str, password: &str) -> Result<String, String> {
+        let mut state = self.state.write().unwrap();
+        if state.owner.is_some() {
+            return Err("Owner is already configured".into());
+        }
+        if password.len() < 12 {
+            return Err("Password must be at least 12 characters".into());
+        }
+
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let salt_bytes: Vec<u8> = (0..16).map(|_| rng.gen()).collect();
+        let salt = hex::encode(salt_bytes);
+
+        let mut hasher = Sha256::new();
+        hasher.update(salt.as_bytes());
+        hasher.update(password.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+
+        let owner = OwnerRecord {
+            username: username.trim().to_string(),
+            salt,
+            hash,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        state.owner = Some(owner);
+        if let Some(ref path) = self.file_path {
+            let _ = std::fs::write(path, serde_json::to_string_pretty(&*state).unwrap_or_default());
+        }
+
+        Ok(username.trim().to_string())
+    }
+
+    pub fn verify_login(&self, username: &str, password: &str) -> bool {
+        let state = self.state.read().unwrap();
+        if let Some(ref owner) = state.owner {
+            if owner.username != username.trim() {
+                return false;
+            }
+
+            let mut hasher = Sha256::new();
+            hasher.update(owner.salt.as_bytes());
+            hasher.update(password.as_bytes());
+            let computed_hash = hex::encode(hasher.finalize());
+
+            return owner.hash.as_bytes().ct_eq(computed_hash.as_bytes()).into();
+        }
+        false
+    }
+
     pub fn list_keys(&self) -> Vec<KeyRecord> {
         self.state.read().unwrap().keys.clone()
     }

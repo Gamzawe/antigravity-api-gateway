@@ -335,6 +335,39 @@ function setupTabs() {
     btn.onclick = () => $('export-accounts-dialog').close();
   }
 
+  $('auth-form').onsubmit = async (e) => {
+    e.preventDefault();
+    $('auth-submit').disabled = true;
+    const path = configured ? 'auth/login' : 'auth/setup';
+    try {
+      const res = await api(path, {
+        method: 'POST',
+        body: {
+          username: $('username').value.trim(),
+          password: $('password').value
+        }
+      });
+      configured = true;
+      const state = await api('session');
+      session = state.authenticated ? state : null;
+      await render();
+      notify(configured ? 'Signed in successfully.' : 'Owner account configured.');
+    } catch (err) {
+      notify(err.message, true);
+    } finally {
+      $('auth-submit').disabled = false;
+    }
+  };
+
+  $('logout').onclick = async () => {
+    try {
+      await api('auth/logout', { method: 'POST' });
+    } catch {}
+    session = null;
+    await render();
+    notify('Signed out.');
+  };
+
   $('copy-export-json').onclick = async () => {
     try {
       await navigator.clipboard.writeText($('export-accounts-text').value);
