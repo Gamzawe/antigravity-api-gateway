@@ -1,31 +1,304 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Antigravity · Private API console</title><link rel="stylesheet" href="/console/style.css"><script src="/console/app.js" defer></script></head>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Antigravity · Private API Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/console/style.css">
+  <script src="/console/app.js" defer></script>
+</head>
 <body>
-<header class="topbar"><a class="brand" href="/console/">Antigravity <span>Private API console</span></a><div class="identity" id="identity" hidden><span id="owner-name"></span><button class="quiet" id="logout">Sign out</button></div></header>
+<header class="topbar">
+  <a class="brand" href="/console/">
+    <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#5e6ad2;"></span>
+    Antigravity <span>Private API Console</span>
+  </a>
+  <div class="identity" id="identity" hidden>
+    <span id="owner-name" style="font-family:'JetBrains Mono',monospace; color:var(--ink);"></span>
+    <button class="quiet" id="logout">Sign out</button>
+  </div>
+</header>
 <main>
 <p id="notice" class="notice" role="status" aria-live="polite"></p>
+
 <section id="auth-view" class="auth" hidden>
-<p class="eyebrow">OWNER ACCESS ONLY</p><h1 id="auth-title">Welcome back.</h1><p id="auth-caption" class="muted">Sign in to manage your private API keys.</p>
-<form id="auth-form">
-<label for="username">Username</label><input id="username" name="username" autocomplete="username" required maxlength="80">
-<label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required maxlength="128"><p class="help" id="password-help" hidden>Choose at least 12 characters. Your password is separate from your API keys.</p>
-<button class="primary full" id="auth-submit" type="submit">Sign in</button>
-</form><p class="footnote">One owner account. Your accounts and keys stay on your server.</p></section>
+  <p class="eyebrow">OWNER ACCESS ONLY</p>
+  <h1 id="auth-title">Welcome back.</h1>
+  <p id="auth-caption" class="muted">Sign in to manage your private API keys.</p>
+  <form id="auth-form">
+    <label for="username">Username</label>
+    <input id="username" name="username" autocomplete="username" required maxlength="80">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="128">
+    <p class="help" id="password-help" hidden>Choose at least 12 characters. Your password is separate from your API keys.</p>
+    <button class="primary full" id="auth-submit" type="submit">Sign in</button>
+  </form>
+  <p class="footnote">One owner account. Your credentials and keys remain strictly local to your server.</p>
+</section>
+
 <section id="dashboard" hidden>
-<div class="section-heading"><div><p class="eyebrow">YOUR WORKSPACE</p><h1>API keys</h1><p class="muted">Create a key. Paste it into your app. Start using your connected models.</p></div><button class="primary" id="open-create">Create API key</button></div>
-<section class="connection" aria-labelledby="connection-title"><div><h2 id="connection-title">Connect an app</h2><p class="muted">Select “OpenAI compatible” in your app’s provider settings.</p></div><div class="url-row"><div class="grow"><label for="api-base">API base URL</label><input id="api-base" readonly></div><button id="copy-url" class="secondary">Copy URL</button></div><p class="help">API key: use a key you create below. Model: choose an ID under “Available models”.</p></section>
-<section class="connection" style="margin-top: 16px; border-left: 4px solid #10b981;"><div><h2 style="display:flex; justify-content:space-between; align-items:center;"><span>In-Memory Cache (W-TinyLFU)</span><button id="purge-cache-btn" class="quiet danger" style="color:#c00; font-size:13px; font-weight:600;">Purge cache</button></h2><p class="muted">Live RAM cache holding completed responses for instant sub-5ms replays.</p></div><div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-top: 12px; background: rgba(0,0,0,0.03); padding: 12px; border-radius: 8px;"><div style="text-align:center;"><span style="font-size:11px; text-transform:uppercase; color:#666; font-weight:600;">Memory Used</span><div id="cache-ram-stat" style="font-size:18px; font-weight:700; color:#111;">-- / 250 MB</div></div><div style="text-align:center;"><span style="font-size:11px; text-transform:uppercase; color:#666; font-weight:600;">Hit Ratio</span><div id="cache-ratio-stat" style="font-size:18px; font-weight:700; color:#10b981;">-- %</div></div><div style="text-align:center;"><span style="font-size:11px; text-transform:uppercase; color:#666; font-weight:600;">Cached Entries</span><div id="cache-entries-stat" style="font-size:18px; font-weight:700; color:#111;">--</div></div><div style="text-align:center;"><span style="font-size:11px; text-transform:uppercase; color:#666; font-weight:600;">Retention (TTL)</span><div id="cache-ttl-stat" style="font-size:18px; font-weight:700; color:#111;">4 hours</div></div></div></section>
-<div class="table-wrap"><table><caption class="sr-only">Your API keys</caption><thead><tr><th>Name</th><th>Key</th><th>Created</th><th>Expires</th><th>Last used</th><th>Status</th><th><span class="sr-only">Action</span></th></tr></thead><tbody id="keys-body"></tbody></table><div id="empty-state" class="empty" hidden><h2>No API keys yet</h2><p class="muted">Create your first key for your phone, editor or application.</p><button class="secondary" id="empty-create">Create your first key</button></div></div>
-<p class="help">Full keys are shown once, when created. Revoke a key immediately if it is lost or exposed.</p>
-<details id="models-details"><summary>Available models <span class="muted">from your connected accounts</span></summary><div class="models-heading"><p class="help">These IDs come from the upstream account catalog. Availability and usage limits can change.</p><button class="quiet" id="refresh-models">Refresh</button></div><p id="models-status" class="help" role="status"></p><ul id="models-list"></ul></details>
-<details><summary>Quick API example</summary><p class="help">Replace YOUR_API_KEY and MODEL_ID. Do not put a secret key in public website code.</p><pre id="example"></pre><button class="secondary" id="copy-example">Copy example</button></details>
-<p class="footnote">This is an unofficial gateway, not Google AI Studio. Google’s model access, quotas and service terms still apply. A Pro subscription is not unlimited official API credit.</p>
+  <div style="display:flex; gap:8px; margin-bottom: 20px; border-bottom: 1px solid var(--line); padding-bottom: 4px;">
+    <button id="tab-keys" class="tab-btn active">API Keys</button>
+    <button id="tab-accounts" class="tab-btn">Google Accounts</button>
+  </div>
+
+  <div id="view-keys">
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">WORKSPACE GATEWAY</p>
+        <h1>API Keys</h1>
+        <p class="muted">Create a key. Paste it into your app. Start consuming your connected models.</p>
+      </div>
+      <button class="primary" id="open-create">Create API Key</button>
+    </div>
+
+    <section class="connection" aria-labelledby="connection-title">
+      <div>
+        <h2 id="connection-title">Connect an App</h2>
+        <p class="muted">Select “OpenAI compatible” in your app or IDE provider settings.</p>
+      </div>
+      <div class="url-row">
+        <div class="grow">
+          <label for="api-base">API Base URL</label>
+          <input id="api-base" readonly>
+        </div>
+        <button id="copy-url" class="secondary" style="margin-top:auto;">Copy URL</button>
+      </div>
+      <p class="help">Use a key created below. Model IDs can be found under “Available models”.</p>
+    </section>
+
+    <section class="connection" style="border-left: 2px solid var(--success);">
+      <div>
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <h2>In-Memory Cache (W-TinyLFU)</h2>
+          <button id="purge-cache-btn" class="quiet danger" style="padding:4px 8px; font-size:11px;">Purge Cache</button>
+        </div>
+        <p class="muted">Live RAM cache holding completed responses for instant sub-5ms replays.</p>
+      </div>
+      <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-top: 12px; background: rgba(0,0,0,0.4); border: 1px solid var(--line); padding: 12px; border-radius: 6px;">
+        <div style="text-align:center;">
+          <span style="font-size:10px; text-transform:uppercase; font-family:'JetBrains Mono',monospace; color:var(--muted); font-weight:600;">Memory Used</span>
+          <div id="cache-ram-stat" style="font-size:14px; font-weight:600; font-family:'JetBrains Mono',monospace; color:var(--ink); margin-top:4px;">-- / 250 MB</div>
+        </div>
+        <div style="text-align:center;">
+          <span style="font-size:10px; text-transform:uppercase; font-family:'JetBrains Mono',monospace; color:var(--muted); font-weight:600;">Hit Ratio</span>
+          <div id="cache-ratio-stat" style="font-size:14px; font-weight:600; font-family:'JetBrains Mono',monospace; color:var(--success); margin-top:4px;">-- %</div>
+        </div>
+        <div style="text-align:center;">
+          <span style="font-size:10px; text-transform:uppercase; font-family:'JetBrains Mono',monospace; color:var(--muted); font-weight:600;">Cached Entries</span>
+          <div id="cache-entries-stat" style="font-size:14px; font-weight:600; font-family:'JetBrains Mono',monospace; color:var(--ink); margin-top:4px;">--</div>
+        </div>
+        <div style="text-align:center;">
+          <span style="font-size:10px; text-transform:uppercase; font-family:'JetBrains Mono',monospace; color:var(--muted); font-weight:600;">Retention (TTL)</span>
+          <div id="cache-ttl-stat" style="font-size:14px; font-weight:600; font-family:'JetBrains Mono',monospace; color:var(--ink); margin-top:4px;">4 hours</div>
+        </div>
+      </div>
+    </section>
+
+    <div class="table-wrap">
+      <table>
+        <caption class="sr-only">Your API keys</caption>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Key</th>
+            <th>Created</th>
+            <th>Expires</th>
+            <th>Last used</th>
+            <th>Status</th>
+            <th><span class="sr-only">Action</span></th>
+          </tr>
+        </thead>
+        <tbody id="keys-body"></tbody>
+      </table>
+      <div id="empty-state" class="empty" hidden>
+        <h2>No API keys yet</h2>
+        <p class="muted">Create your first key for your phone, editor or application.</p>
+        <button class="secondary" id="empty-create">Create your first key</button>
+      </div>
+    </div>
+    <p class="help">Full keys are displayed once upon creation. Revoke keys immediately if compromised.</p>
+
+    <details id="models-details">
+      <summary>Available Models <span class="muted">(From connected accounts)</span></summary>
+      <div class="models-heading" style="display:flex; justify-content:space-between; align-items:center; margin:8px 0;">
+        <p class="help" style="margin:0;">These IDs come from the upstream account catalog. Availability is quota-bounded.</p>
+        <button class="quiet" id="refresh-models">Refresh</button>
+      </div>
+      <p id="models-status" class="help" role="status"></p>
+      <ul id="models-list" style="margin: 8px 0; padding-left: 20px; font-family:'JetBrains Mono',monospace; font-size:11px; color:#cbd5e1;"></ul>
+    </details>
+
+    <details>
+      <summary>Quick API Example (cURL)</summary>
+      <p class="help">Replace YOUR_API_KEY and MODEL_ID.</p>
+      <pre id="example"></pre>
+      <button class="secondary" id="copy-example">Copy Example</button>
+    </details>
+  </div>
+
+  <div id="view-accounts" hidden>
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">ACCOUNT POOL & QUOTA</p>
+        <h1>Google Accounts</h1>
+        <p class="muted">Add or remove connected accounts. Requests auto-balance across all active accounts.</p>
+      </div>
+      <div style="display:flex; gap:8px;">
+        <button class="secondary" id="open-export-accounts">Export ACCOUNTS_JSON</button>
+        <button class="primary" id="open-add-account">+ Add Google Account</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <caption class="sr-only">Connected Google Accounts</caption>
+        <thead>
+          <tr>
+            <th>Email</th>
+            <th>Project</th>
+            <th>In-Flight</th>
+            <th>Concurrency</th>
+            <th>Status</th>
+            <th><span class="sr-only">Action</span></th>
+          </tr>
+        </thead>
+        <tbody id="accounts-body"></tbody>
+      </table>
+      <div id="empty-accounts" class="empty" hidden>
+        <h2>No accounts in pool</h2>
+        <p class="muted">Add at least one Google OAuth account to begin serving model requests.</p>
+        <button class="secondary" id="empty-add-account">Add first account</button>
+      </div>
+    </div>
+  </div>
+
+  <p class="footnote">Antigravity Private Gateway is an autonomous bridge, not Google AI Studio. Google’s model terms apply.</p>
 </section>
 </main>
-<dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><h2>Create an API key</h2><button type="button" class="quiet close-create" aria-label="Close">×</button></div><p class="muted">Give each app its own key so you can revoke or expire it separately.</p><label for="key-name">Key name</label><input id="key-name" maxlength="80" placeholder="e.g. My phone / Client App" required><label for="key-expiry">Expiration</label><select id="key-expiry" style="width: 100%; padding: 8px 12px; margin-bottom: 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px;"><option value="0">Never (No expiration)</option><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option><option value="custom">Custom date...</option></select><div id="custom-date-wrap" hidden><label for="key-custom-date">Expiration date</label><input id="key-custom-date" type="date" style="width: 100%; padding: 8px 12px; margin-bottom: 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px;"></div><div class="actions"><button type="button" class="secondary close-create">Cancel</button><button type="submit" class="primary" id="create-submit">Create key</button></div></form></dialog>
-<dialog id="secret-dialog"><div class="dialog-heading"><h2>Your key is ready</h2></div><p>Copy this key now. You won’t be able to see it again.</p><label for="new-key">New API key</label><input id="new-key" readonly autocomplete="off" spellcheck="false"><p class="help">Treat it like a password. Anyone with this key can use your model quota.</p><div class="actions"><button class="secondary" id="copy-key">Copy key</button><button class="primary" id="close-secret">I’ve saved my key</button></div></dialog>
-<dialog id="revoke-dialog"><h2>Revoke this key?</h2><p id="revoke-caption">Apps using this key will immediately lose access.</p><div class="actions"><button class="secondary" id="cancel-revoke">Keep key</button><button class="danger" id="confirm-revoke">Revoke key</button></div></dialog>
-<dialog id="delete-dialog"><h2>Delete this key permanently?</h2><p id="delete-caption">This key will be completely removed from your server and can never be used again.</p><div class="actions"><button class="secondary" id="cancel-delete">Cancel</button><button class="danger" id="confirm-delete">Delete permanently</button></div></dialog>
-<dialog id="edit-dialog"><form id="edit-form"><div class="dialog-heading"><h2>Update key / Expiration date</h2><button type="button" class="quiet close-edit" aria-label="Close">×</button></div><p id="edit-caption" class="muted">Change the expiration date or name for this key.</p><label for="edit-name">Key name</label><input id="edit-name" maxlength="80" required><label for="edit-expiry-date">New expiration date</label><input id="edit-expiry-date" type="date" style="width: 100%; padding: 8px 12px; margin-bottom: 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px;"><p class="help">Clear the date if you want the key to never expire.</p><div class="actions"><button type="button" class="secondary close-edit">Cancel</button><button type="submit" class="primary" id="edit-submit">Save changes</button></div></form></dialog>
-</body></html>
+
+<dialog id="create-dialog">
+  <form id="create-form">
+    <div class="dialog-heading">
+      <h2>Create API Key</h2>
+      <button type="button" class="quiet close-create" aria-label="Close">✕</button>
+    </div>
+    <p class="muted">Assign unique keys per client or device to isolate revocations.</p>
+    <label for="key-name">Key Name</label>
+    <input id="key-name" maxlength="80" placeholder="e.g. My Phone / OpenCode" required>
+    <label for="key-expiry">Expiration</label>
+    <select id="key-expiry">
+      <option value="0">Never (No expiration)</option>
+      <option value="7">7 days</option>
+      <option value="30">30 days</option>
+      <option value="90">90 days</option>
+      <option value="custom">Custom date...</option>
+    </select>
+    <div id="custom-date-wrap" hidden>
+      <label for="key-custom-date">Expiration Date</label>
+      <input id="key-custom-date" type="date">
+    </div>
+    <div class="actions">
+      <button type="button" class="secondary close-create">Cancel</button>
+      <button type="submit" class="primary" id="create-submit">Create Key</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="secret-dialog">
+  <div class="dialog-heading">
+    <h2>Your Key is Ready</h2>
+  </div>
+  <p class="muted">Copy this key now. You will not be able to view it again.</p>
+  <label for="new-key">New API Key</label>
+  <input id="new-key" readonly autocomplete="off" spellcheck="false" style="font-family:'JetBrains Mono',monospace;">
+  <p class="help">Store securely. Anyone with this key can consume your quota.</p>
+  <div class="actions">
+    <button class="secondary" id="copy-key">Copy Key</button>
+    <button class="primary" id="close-secret">I’ve Saved My Key</button>
+  </div>
+</dialog>
+
+<dialog id="revoke-dialog">
+  <h2>Revoke This Key?</h2>
+  <p id="revoke-caption" class="muted">Apps using this key will immediately lose access.</p>
+  <div class="actions">
+    <button class="secondary" id="cancel-revoke">Keep Key</button>
+    <button class="danger" id="confirm-revoke">Revoke Key</button>
+  </div>
+</dialog>
+
+<dialog id="delete-dialog">
+  <h2>Delete Key Permanently?</h2>
+  <p id="delete-caption" class="muted">This key will be permanently purged from your server database.</p>
+  <div class="actions">
+    <button class="secondary" id="cancel-delete">Cancel</button>
+    <button class="danger" id="confirm-delete">Delete Permanently</button>
+  </div>
+</dialog>
+
+<dialog id="add-account-dialog">
+  <form id="add-account-form">
+    <div class="dialog-heading">
+      <h2>Add Google Account</h2>
+      <button type="button" class="quiet close-account-dialog" aria-label="Close">✕</button>
+    </div>
+    <p class="muted">Add a Google OAuth account with refresh token to the load-balancing pool.</p>
+    <label for="acc-email">Account Email</label>
+    <input id="acc-email" type="email" placeholder="e.g. developer@gmail.com" required>
+    <label for="acc-token">Refresh Token</label>
+    <input id="acc-token" type="text" placeholder="1//04... refresh token" required style="font-family:'JetBrains Mono',monospace;">
+    <label for="acc-project">Project ID (Optional)</label>
+    <input id="acc-project" placeholder="aicode-consumers">
+    <div class="actions">
+      <button type="button" class="secondary close-account-dialog">Cancel</button>
+      <button type="submit" class="primary" id="add-account-submit">Add to Pool</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="delete-account-dialog">
+  <h2>Remove Google Account?</h2>
+  <p id="delete-account-caption" class="muted">This account will be drained and removed from the active rotation pool.</p>
+  <div class="actions">
+    <button class="secondary" id="cancel-delete-account">Cancel</button>
+    <button class="danger" id="confirm-delete-account">Remove Account</button>
+  </div>
+</dialog>
+
+<dialog id="export-accounts-dialog">
+  <div class="dialog-heading">
+    <h2>Export ACCOUNTS_JSON</h2>
+    <button type="button" class="quiet close-export-dialog" aria-label="Close">✕</button>
+  </div>
+  <p class="muted">Copy this JSON and update the <code>ACCOUNTS_JSON</code> environment variable in your dashboard.</p>
+  <textarea id="export-accounts-text" readonly style="width: 100%; height: 180px; font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 10px; background: rgba(0,0,0,0.4); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); resize: none;"></textarea>
+  <div class="actions">
+    <button class="secondary" id="copy-export-json">Copy JSON</button>
+    <button class="primary close-export-dialog">Done</button>
+  </div>
+</dialog>
+
+<dialog id="edit-dialog">
+  <form id="edit-form">
+    <div class="dialog-heading">
+      <h2>Update Key Expiration</h2>
+      <button type="button" class="quiet close-edit" aria-label="Close">✕</button>
+    </div>
+    <p id="edit-caption" class="muted">Modify key description or change expiration date.</p>
+    <label for="edit-name">Key Name</label>
+    <input id="edit-name" maxlength="80" required>
+    <label for="edit-expiry-date">New Expiration Date</label>
+    <input id="edit-expiry-date" type="date">
+    <p class="help">Leave date empty for no expiration.</p>
+    <div class="actions">
+      <button type="button" class="secondary close-edit">Cancel</button>
+      <button type="submit" class="primary" id="edit-submit">Save Changes</button>
+    </div>
+  </form>
+</dialog>
+</body>
+</html>

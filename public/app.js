@@ -249,4 +249,170 @@ if ($('purge-cache-btn')) {
     }
   };
 }
-(async () => { try { const state = await api('session'); configured = state.configured; session = state.authenticated ? state : null; await render(); } catch (error) { notify(error.message, true); } })();
+
+let activeTab = 'keys';
+let deletingAccountEmail = null;
+
+function setupTabs() {
+  $('tab-keys').onclick = () => {
+    activeTab = 'keys';
+    $('tab-keys').style.color = 'var(--ink)';
+    $('tab-keys').style.borderBottom = '2px solid var(--accent)';
+    $('tab-accounts').style.color = 'var(--muted)';
+    $('tab-accounts').style.borderBottom = 'none';
+    $('view-keys').hidden = false;
+    $('view-accounts').hidden = true;
+  };
+
+  $('tab-accounts').onclick = async () => {
+    activeTab = 'accounts';
+    $('tab-accounts').style.color = 'var(--ink)';
+    $('tab-accounts').style.borderBottom = '2px solid var(--accent)';
+    $('tab-keys').style.color = 'var(--muted)';
+    $('tab-keys').style.borderBottom = 'none';
+    $('view-keys').hidden = true;
+    $('view-accounts').hidden = false;
+    await loadAccounts();
+  };
+
+  $('open-add-account').onclick = () => $('add-account-dialog').showModal();
+  $('empty-add-account').onclick = () => $('add-account-dialog').showModal();
+  for (const btn of document.querySelectorAll('.close-account-dialog')) {
+    btn.onclick = () => $('add-account-dialog').close();
+  }
+
+  $('add-account-form').onsubmit = async (e) => {
+    e.preventDefault();
+    $('add-account-submit').disabled = true;
+    try {
+      await api('accounts', {
+        method: 'POST',
+        body: JSON.stringify({
+          email: $('acc-email').value.trim(),
+          refreshToken: $('acc-token').value.trim(),
+          projectId: $('acc-project').value.trim() || undefined
+        })
+      });
+      $('add-account-dialog').close();
+      $('add-account-form').reset();
+      await loadAccounts();
+      notify('Google Account successfully added to pool.');
+    } catch (err) {
+      notify(err.message, true);
+    } finally {
+      $('add-account-submit').disabled = false;
+    }
+  };
+
+  $('cancel-delete-account').onclick = () => $('delete-account-dialog').close();
+  $('confirm-delete-account').onclick = async () => {
+    if (!deletingAccountEmail) return;
+    $('confirm-delete-account').disabled = true;
+    try {
+      await api('accounts/' + encodeURIComponent(deletingAccountEmail), { method: 'DELETE' });
+      $('delete-account-dialog').close();
+      await loadAccounts();
+      notify('Account removed from active pool.');
+    } catch (err) {
+      notify(err.message, true);
+    } finally {
+      $('confirm-delete-account').disabled = false;
+      deletingAccountEmail = null;
+    }
+  };
+
+  $('open-export-accounts').onclick = async () => {
+    try {
+      const data = await api('accounts/export');
+      $('export-accounts-text').value = JSON.stringify(data, null, 2);
+      $('export-accounts-dialog').showModal();
+    } catch (err) {
+      notify(err.message, true);
+    }
+  };
+
+  for (const btn of document.querySelectorAll('.close-export-dialog')) {
+    btn.onclick = () => $('export-accounts-dialog').close();
+  }
+
+  $('copy-export-json').onclick = async () => {
+    try {
+      await navigator.clipboard.writeText($('export-accounts-text').value);
+      notify('ACCOUNTS_JSON copied to clipboard!');
+    } catch (err) {
+      notify('Failed to copy: ' + err.message, true);
+    }
+  };
+}
+
+async function loadAccounts() {
+  const tbody = $('accounts-body');
+  try {
+    const data = await api('accounts');
+    tbody.replaceChildren();
+    if (!data.accounts || data.accounts.length === 0) {
+      $('empty-accounts').hidden = false;
+      return;
+    }
+    $('empty-accounts').hidden = true;
+    for (const acc of data.accounts) {
+      const tr = document.createElement('tr');
+
+      const tdEmail = document.createElement('td');
+      tdEmail.textContent = acc.email;
+      tdEmail.style.fontWeight = '600';
+      tr.appendChild(tdEmail);
+
+      const tdProject = document.createElement('td');
+      tdProject.textContent = acc.project_id || 'default';
+      tr.appendChild(tdProject);
+
+      const tdInFlight = document.createElement('td');
+      tdInFlight.textContent = `${acc.in_flight} active`;
+      tr.appendChild(tdInFlight);
+
+      const tdCap = document.createElement('td');
+      tdCap.textContent = `${acc.max_concurrency} max`;
+      tr.appendChild(tdCap);
+
+      const tdStatus = document.createElement('td');
+      const badge = document.createElement('span');
+      badge.textContent = acc.status;
+      badge.style.padding = '2px 8px';
+      badge.style.borderRadius = '12px';
+      badge.style.fontSize = '12px';
+      badge.style.fontWeight = '600';
+      if (acc.status === 'active') {
+        badge.style.background = 'rgba(16, 185, 129, 0.12)';
+        badge.style.color = '#34d399';
+        badge.style.border = '1px solid rgba(16, 185, 129, 0.25)';
+      } else {
+        badge.style.background = 'rgba(239, 68, 68, 0.12)';
+        badge.style.color = '#f87171';
+        badge.style.border = '1px solid rgba(239, 68, 68, 0.25)';
+      }
+      tdStatus.appendChild(badge);
+      tr.appendChild(tdStatus);
+
+      const tdAction = document.createElement('td');
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'quiet danger';
+      removeBtn.textContent = 'Remove';
+      removeBtn.style.color = '#c00';
+      removeBtn.style.fontSize = '13px';
+      removeBtn.onclick = () => {
+        deletingAccountEmail = acc.email;
+        $('delete-account-caption').textContent = `Remove ${acc.email} from active pool?`;
+        $('delete-account-dialog').showModal();
+      };
+      tdAction.appendChild(removeBtn);
+      tr.appendChild(tdAction);
+
+      tbody.appendChild(tr);
+    }
+  } catch (err) {
+    notify(err.message, true);
+  }
+}
+
+(async () => { try { const state = await api('session'); configured = state.configured; session = state.authenticated ? state : null; await render(); setupTabs(); } catch (error) { notify(error.message, true); } })();
