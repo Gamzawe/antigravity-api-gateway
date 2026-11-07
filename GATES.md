@@ -21,3 +21,8 @@ OWNS: src/**, tests/**, deploy/**, Dockerfile, docker-compose.yml, package.json
   CHECK: npm run test:console
   EXPECT: pass 17
   EVIDENCE: automatic-evidence=v1; definition-sha256=435102375ec566c894bb4bc6a429a834a7c4da5e13915e960ccecd8b9a0c9e9e; exit=0; EXPECT=matched; output-sha256=6561453cbb666b86491ea3d5bdb5a63039c627ea0bf087637e651e1c56898e34; output-bytes=2025; shell=C:\WINDOWS\system32\cmd.exe; cwd=D:\Side-Projects\antigravity-api-gateway; path=928817dd1325/62 entries
+
+- [x] G5: Milestone 4 client integration validated against the live deployed gateway (WP-14). Draft-07 JSON-Schema tool declarations containing `$schema`, `exclusiveMinimum`, and `exclusiveMaximum` are accepted; non-streaming and streaming tool calls return `finish_reason: "tool_calls"`; plain chat returns real assistant content (no client-version deprecation).
+  CHECK: GATEWAY_URL=https://antigravity-api-gateway.onrender.com GATEWAY_API_KEY=*** node --test tests/integration/client-compatibility.test.mjs
+  EXPECT: pass 3
+  EVIDENCE: live=https://antigravity-api-gateway.onrender.com; commit=64206fc; run=2026-11-07; exit=0; EXPECT=matched; tests=3 pass 3 fail 0; authorization=client-approval (granted by "test it for m4"); prerequisite fixes: schema sanitizer (96d0b08), account-mgmt storage build fix (995007e), 403 TOS account quarantine (ce27236), client version 2.5.5 (64206fc). WP-13 (live-approval) and WP-16 (remote-approval) remain pending explicit authorization.
