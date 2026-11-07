@@ -26,6 +26,8 @@ fn is_unsupported_schema_key(key: &str) -> bool {
             | "anyOf"
             | "oneOf"
             | "strict"
+            | "exclusiveMinimum"
+            | "exclusiveMaximum"
     )
 }
 
@@ -693,6 +695,27 @@ data: {"response": {"candidates": [{"content": {"role": "model","parts": [{"thou
         let required = cleaned["required"].as_array().unwrap();
         assert_eq!(required.len(), 1);
         assert_eq!(required[0], "cmd");
+    }
+
+    #[test]
+    fn test_sanitize_schema_removes_exclusive_bounds() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "exclusiveMaximum": 15
+                }
+            },
+            "required": ["days"]
+        });
+
+        let cleaned = sanitize_schema_for_gemini(&schema);
+        let days = &cleaned["properties"]["days"];
+        assert!(days.get("exclusiveMinimum").is_none());
+        assert!(days.get("exclusiveMaximum").is_none());
+        assert_eq!(days["type"], "integer");
     }
 
     #[test]
