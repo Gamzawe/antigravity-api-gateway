@@ -46,8 +46,17 @@ impl CloudCodeClient {
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        headers.insert("User-Agent", HeaderValue::from_static("antigravity/1.11.5 windows/amd64"));
-        headers.insert("X-Goog-Api-Client", HeaderValue::from_static("google-cloud-sdk vscode_cloudshelleditor/0.1"));
+        let version = std::env::var("ANTIGRAVITY_CLIENT_VERSION")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "1.20.5".to_string());
+        headers.insert(
+            "User-Agent",
+            HeaderValue::from_str(&format!("antigravity/{} windows/amd64", version))
+                .map_err(|e| e.to_string())?,
+        );
+        headers.insert("X-Goog-Api-Client", HeaderValue::from_static("gl-node/22.21.1"));
 
         let url = format!("{}/v1internal:streamGenerateContent?alt=sse", endpoint);
 
