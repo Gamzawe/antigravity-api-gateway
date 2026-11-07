@@ -519,6 +519,16 @@ async fn chat_completions(
                     state.pool.mark_rate_limited(&account, 30).await;
                     last_err = format!("Account {} TTFB timed out after 11s", account.email);
                     continue;
+                } else if e == "GOOGLE_403_ACCOUNT_DISABLED" {
+                    tracing::warn!(
+                        "Account {} returned 403 PERMISSION_DENIED (TOS violation). Quarantining and failing over (attempt {}/{})",
+                        account.email,
+                        attempt + 1,
+                        max_retries
+                    );
+                    state.pool.disable_account(&account).await;
+                    last_err = "Upstream Google 403: Account disabled (TOS/PERMISSION_DENIED), quarantined".into();
+                    continue;
                 }
                 last_err = e;
             }

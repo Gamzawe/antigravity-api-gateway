@@ -66,6 +66,12 @@ impl CloudCodeClient {
             if status.as_u16() == 429 {
                 return Err("GOOGLE_429_RATE_LIMITED".to_string());
             }
+            if status.as_u16() == 403
+                && (err_body.contains("TOS_VIOLATION")
+                    || err_body.contains("service has been disabled"))
+            {
+                return Err("GOOGLE_403_ACCOUNT_DISABLED".to_string());
+            }
             return Err(format!("Google API Error {}: {}", status, err_body));
         }
 

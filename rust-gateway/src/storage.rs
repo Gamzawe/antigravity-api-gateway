@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Instant, Duration};
 use tokio::sync::{RwLock, Mutex, Semaphore};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountFileEntry {
@@ -29,7 +29,7 @@ pub struct ManagedAccount {
     pub email: String,
     pub refresh_token: String,
     pub project_id: String,
-    pub enabled: bool,
+    pub enabled: AtomicBool,
     pub in_flight: Arc<AtomicUsize>,
     pub remaining_fraction: RwLock<f64>,
     pub last_used: RwLock<Instant>,
@@ -111,7 +111,7 @@ impl AccountPool {
                         email: entry.email,
                         refresh_token: rt,
                         project_id: entry.project_id.unwrap_or_else(|| "aicode-consumers".into()),
-                        enabled: entry.enabled,
+                        enabled: AtomicBool::new(entry.enabled),
                         in_flight: Arc::new(AtomicUsize::new(0)),
                         remaining_fraction: RwLock::new(1.0),
                         last_used: RwLock::new(Instant::now()),
@@ -306,7 +306,7 @@ impl AccountPool {
         let mut available_indices = Vec::new();
 
         for (idx, acc) in accounts.iter().enumerate() {
-            if !acc.enabled { continue; }
+            if !acc.enabled.load(Ordering::Relaxed) { continue; }
             if let Some(until) = *acc.rate_limited_until.read().await {
                 if until > now { continue; }
             }
@@ -389,7 +389,7 @@ impl AccountPool {
                     email: a.email.clone(),
                     refresh_token: Some(a.refresh_token.clone()),
                     project_id: Some(a.project_id.clone()),
-                    enabled: a.enabled,
+                    enabled: a.enabled.load(Ordering::Relaxed),
                 })
                 .collect(),
         }
@@ -421,7 +421,7 @@ impl AccountPool {
             out.push(serde_json::json!({
                 "email": acc.email,
                 "project_id": acc.project_id,
-                "enabled": acc.enabled,
+                "enabled": acc.enabled.load(Ordering::Relaxed),
                 "in_flight": in_flight,
                 "remaining_fraction": remaining_fraction,
                 "rate_limited": rate_limited,
@@ -444,7 +444,7 @@ impl AccountPool {
             email: entry.email.clone(),
             refresh_token,
             project_id,
-            enabled: entry.enabled,
+            enabled: AtomicBool::new(entry.enabled),
             in_flight: Arc::new(AtomicUsize::new(0)),
             remaining_fraction: RwLock::new(1.0),
             last_used: RwLock::new(Instant::now()),
@@ -462,6 +462,16 @@ impl AccountPool {
             }
         }
         self.persist_accounts().await
+    }
+
+    /// Quarantine an account that Google has disabled (e.g. TOS violation) so it
+    /// is excluded from future lease selection for the life of the process.
+    pub async fn disable_account(&self, acc: &ManagedAccount) {
+        acc.enabled.store(false, Ordering::SeqCst);
+        tracing::warn!("Account {} disabled and removed from rotation (upstream PERMISSION_DENIED)", acc.email);
+        if let Err(e) = self.persist_accounts().await {
+            tracing::warn!("Failed to persist disabled account {}: {}", acc.email, e);
+        }
     }
 
     pub async fn remove_account(&self, email: &str) -> Result<bool, String> {
