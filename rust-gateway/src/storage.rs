@@ -41,7 +41,8 @@ pub struct ManagedAccount {
 }
 
 pub struct AccountPool {
-    accounts: Vec<Arc<ManagedAccount>>,
+    accounts: RwLock<Vec<Arc<ManagedAccount>>>,
+    accounts_path: Option<String>,
     client: reqwest::Client,
     total_in_flight: Arc<AtomicUsize>,
     queue_waiting: Arc<AtomicUsize>,
@@ -80,7 +81,8 @@ impl AccountPool {
         );
 
         Self {
-            accounts: Vec::new(),
+            accounts: RwLock::new(Vec::new()),
+            accounts_path: None,
             client: reqwest::Client::builder()
                 .pool_max_idle_per_host(100)
                 .pool_idle_timeout(Duration::from_secs(90))
@@ -148,7 +150,8 @@ impl AccountPool {
         );
 
         Ok(Self {
-            accounts,
+            accounts: RwLock::new(accounts),
+            accounts_path: None,
             client: reqwest::Client::builder()
                 .pool_max_idle_per_host(100)
                 .pool_idle_timeout(Duration::from_secs(90))
@@ -168,7 +171,9 @@ impl AccountPool {
 
     pub fn load_from_file(path: &str, max_per_account: usize, max_total: usize) -> Result<Self, String> {
         let content = std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path, e))?;
-        Self::load_from_json_str(&content, max_per_account, max_total)
+        let mut pool = Self::load_from_json_str(&content, max_per_account, max_total)?;
+        pool.accounts_path = Some(path.to_string());
+        Ok(pool)
     }
 
     /// Single-flight OAuth refresh to avoid thundering herd on token expiration
@@ -297,9 +302,10 @@ impl AccountPool {
 
         // 4. Select candidate accounts (< max_per_account and not rate limited)
         let now = Instant::now();
+        let accounts = self.accounts.read().await;
         let mut available_indices = Vec::new();
 
-        for (idx, acc) in self.accounts.iter().enumerate() {
+        for (idx, acc) in accounts.iter().enumerate() {
             if !acc.enabled { continue; }
             if let Some(until) = *acc.rate_limited_until.read().await {
                 if until > now { continue; }
@@ -317,23 +323,24 @@ impl AccountPool {
 
         // Prefix-Affinity Selection: if caller provides affinity hash, target that account first
         let chosen_idx = if let Some(hash) = affinity_hash {
-            let preferred_idx = (hash as usize) % self.accounts.len();
+            let preferred_idx = (hash as usize) % accounts.len();
             if available_indices.contains(&preferred_idx) {
                 preferred_idx
             } else {
                 // Preferred account busy/rate-limited: fall back to least-loaded candidate
                 *available_indices.iter().min_by_key(|&&idx| {
-                    self.accounts[idx].in_flight.load(Ordering::SeqCst)
+                    accounts[idx].in_flight.load(Ordering::SeqCst)
                 }).unwrap_or(&available_indices[0])
             }
         } else {
             // No affinity: select least-loaded candidate
             *available_indices.iter().min_by_key(|&&idx| {
-                self.accounts[idx].in_flight.load(Ordering::SeqCst)
+                accounts[idx].in_flight.load(Ordering::SeqCst)
             }).unwrap_or(&available_indices[0])
         };
 
-        let chosen = self.accounts[chosen_idx].clone();
+        let chosen = accounts[chosen_idx].clone();
+        drop(accounts);
         chosen.in_flight.fetch_add(1, Ordering::SeqCst);
         self.total_in_flight.fetch_add(1, Ordering::SeqCst);
         *chosen.last_used.write().await = Instant::now();
@@ -356,8 +363,122 @@ impl AccountPool {
         tracing::warn!("Account {} marked as rate-limited for {}s", acc.email, duration_secs);
     }
 
-    pub fn get_account_count(&self) -> usize {
-        self.accounts.len()
+    pub async fn get_account_count(&self) -> usize {
+        self.accounts.read().await.len()
+    }
+
+    fn resolve_accounts_path(&self) -> Option<String> {
+        if let Some(ref path) = self.accounts_path {
+            return Some(path.clone());
+        }
+        if std::path::Path::new("data/accounts.json").exists() {
+            Some("data/accounts.json".into())
+        } else if std::path::Path::new("../data/accounts.json").exists() {
+            Some("../data/accounts.json".into())
+        } else {
+            None
+        }
+    }
+
+    pub async fn export_accounts_json(&self) -> AccountsConfig {
+        let accounts = self.accounts.read().await;
+        AccountsConfig {
+            accounts: accounts
+                .iter()
+                .map(|a| AccountFileEntry {
+                    email: a.email.clone(),
+                    refresh_token: Some(a.refresh_token.clone()),
+                    project_id: Some(a.project_id.clone()),
+                    enabled: a.enabled,
+                })
+                .collect(),
+        }
+    }
+
+    async fn persist_accounts(&self) -> Result<(), String> {
+        if let Some(path) = self.resolve_accounts_path() {
+            let config = self.export_accounts_json().await;
+            let json = serde_json::to_string_pretty(&config)
+                .map_err(|e| format!("Failed to serialize accounts: {}", e))?;
+            std::fs::write(&path, json)
+                .map_err(|e| format!("Failed to write {}: {}", path, e))?;
+        }
+        Ok(())
+    }
+
+    pub async fn list_accounts_telemetry(&self) -> Vec<serde_json::Value> {
+        let accounts = self.accounts.read().await;
+        let now = Instant::now();
+        let mut out = Vec::with_capacity(accounts.len());
+        for acc in accounts.iter() {
+            let in_flight = acc.in_flight.load(Ordering::SeqCst);
+            let remaining_fraction = *acc.remaining_fraction.read().await;
+            let rate_limited_until = *acc.rate_limited_until.read().await;
+            let (rate_limited, seconds_remaining) = match rate_limited_until {
+                Some(until) if until > now => (true, Some(until.duration_since(now).as_secs())),
+                _ => (false, None),
+            };
+            out.push(serde_json::json!({
+                "email": acc.email,
+                "project_id": acc.project_id,
+                "enabled": acc.enabled,
+                "in_flight": in_flight,
+                "remaining_fraction": remaining_fraction,
+                "rate_limited": rate_limited,
+                "rate_limited_seconds_remaining": seconds_remaining,
+            }));
+        }
+        out
+    }
+
+    pub async fn add_or_update_account(&self, entry: AccountFileEntry) -> Result<(), String> {
+        let refresh_token = entry.refresh_token.clone().unwrap_or_default();
+        if refresh_token.trim().is_empty() {
+            return Err("refreshToken is required".into());
+        }
+        let project_id = entry
+            .project_id
+            .clone()
+            .unwrap_or_else(|| "aicode-consumers".into());
+        let new_account = Arc::new(ManagedAccount {
+            email: entry.email.clone(),
+            refresh_token,
+            project_id,
+            enabled: entry.enabled,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            remaining_fraction: RwLock::new(1.0),
+            last_used: RwLock::new(Instant::now()),
+            rate_limited_until: RwLock::new(None),
+            access_token: RwLock::new(None),
+            token_expires_at: RwLock::new(Instant::now()),
+            refresh_mutex: Mutex::new(()),
+        });
+        {
+            let mut accounts = self.accounts.write().await;
+            if let Some(pos) = accounts.iter().position(|a| a.email == entry.email) {
+                accounts[pos] = new_account;
+            } else {
+                accounts.push(new_account);
+            }
+        }
+        self.persist_accounts().await
+    }
+
+    pub async fn remove_account(&self, email: &str) -> Result<bool, String> {
+        let removed = {
+            let mut accounts = self.accounts.write().await;
+            match accounts.iter().position(|a| a.email == email) {
+                Some(pos) => {
+                    accounts.remove(pos);
+                    true
+                }
+                None => false,
+            }
+        };
+        if removed {
+            self.persist_accounts().await?;
+        }
+        Ok(removed)
     }
 
     pub fn get_total_in_flight(&self) -> usize {
