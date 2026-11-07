@@ -50,7 +50,7 @@ impl CloudCodeClient {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "1.20.5".to_string());
+            .unwrap_or_else(|| "2.5.5".to_string());
         headers.insert(
             "User-Agent",
             HeaderValue::from_str(&format!("antigravity/{} windows/amd64", version))
